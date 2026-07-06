@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: finanzas-back
+    runtime: node
+    plan: free
+    buildCommand: npm install && npm run build
+    startCommand: npm run start:prod
+    envVars:
+      - key: MONGODB_URI
+        sync: false
