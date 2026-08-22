@@ -9,4 +9,8 @@ export class AppController {
   getHealth(): { status: string; service: string } {
     return this.appService.getHealth();
   }
+
+  getHello(): string {
+    return 'Hello World!';
+  }
 }

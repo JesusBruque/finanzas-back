@@ -15,8 +15,8 @@ describe('AppController', () => {
   });
 
   describe('root', () => {
-    it('should return "Hello World!"', () => {
-      expect(appController.getHello()).toBe('Hello World!');
+    it('should return the health payload for the backend service', () => {
+      expect(appController.getHealth()).toEqual({ status: 'ok', service: 'finanzas-back' });
     });
   });
 });
