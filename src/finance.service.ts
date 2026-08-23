@@ -450,6 +450,8 @@ export class FinanceService {
       state,
       redirectUrl,
       country,
+      upstreamStatus: upstreamResponse.status,
+      authUrlSource: locationHeader ? 'location' : 'body',
     };
   }
 
