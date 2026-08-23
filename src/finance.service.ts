@@ -951,7 +951,7 @@ export class FinanceService {
     const jwt = this.createEnableBankingJwt(appId, privateKeyPem);
     const probes = await this.probeEnableBankingSessionEndpoints(sessionId, jwt);
     const sessionProbe = probes.find((item) => item.url.endsWith(`/sessions/${sessionId}`));
-    const sessionParsed = sessionProbe?.preview ? this.safeParseJson(sessionProbe.preview) : null;
+    const sessionParsed = sessionProbe?.parsed ?? null;
     const accountIds = await this.fetchEnableBankingAccountIds(sessionId, jwt);
     const perAccount: Array<{
       accountId: string;
@@ -994,6 +994,7 @@ export class FinanceService {
     hasJson: boolean;
     keys: string[];
     preview: string;
+    parsed: Record<string, unknown> | null;
   }>> {
     const urls = [
       `https://api.enablebanking.com/sessions/${sessionId}`,
@@ -1008,6 +1009,7 @@ export class FinanceService {
       hasJson: boolean;
       keys: string[];
       preview: string;
+      parsed: Record<string, unknown> | null;
     }> = [];
 
     for (const url of urls) {
@@ -1028,6 +1030,7 @@ export class FinanceService {
           hasJson: Boolean(parsed),
           keys: parsed ? Object.keys(parsed) : [],
           preview: bodyText.slice(0, 400),
+          parsed,
         });
       } catch (error) {
         results.push({
@@ -1036,6 +1039,7 @@ export class FinanceService {
           hasJson: false,
           keys: [],
           preview: error instanceof Error ? error.message : 'request failed',
+          parsed: null,
         });
       }
     }
