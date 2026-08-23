@@ -457,34 +457,7 @@ export class FinanceService {
   private async fetchEnableBankingAccountTransactions(accountId: string, jwt: string): Promise<Record<string, unknown> | null> {
     const state = await this.getEnableBankingState();
     const sessionId = typeof state.latestSessionId === 'string' ? state.latestSessionId : null;
-    const today = new Date();
-    const dateFrom = new Date(today);
-    dateFrom.setFullYear(today.getFullYear() - 1);
-    const dateFromIso = dateFrom.toISOString().slice(0, 10);
-    const dateToIso = today.toISOString().slice(0, 10);
-
-    const candidates = [
-      `https://api.enablebanking.com/accounts/${accountId}/transactions`,
-      `https://api.enablebanking.com/accounts/${accountId}/transactions?booking_status=booked`,
-      `https://api.enablebanking.com/accounts/${accountId}/transactions?booking_status=BOOK`,
-      `https://api.enablebanking.com/accounts/${accountId}/transactions?booking_status=both`,
-      `https://api.enablebanking.com/accounts/${accountId}/transactions?date_from=${dateFromIso}&date_to=${dateToIso}`,
-      `https://api.enablebanking.com/accounts/${accountId}/transactions?booking_status=booked&date_from=${dateFromIso}&date_to=${dateToIso}`,
-      `https://api.enablebanking.com/accounts/${accountId}/transactions?booking_status=BOOK&date_from=${dateFromIso}&date_to=${dateToIso}`,
-      `https://api.enablebanking.com/accounts/${accountId}/transactions?booking_status=both&date_from=${dateFromIso}&date_to=${dateToIso}`,
-      ...(sessionId
-        ? [
-            `https://api.enablebanking.com/sessions/${sessionId}/accounts/${accountId}/transactions`,
-            `https://api.enablebanking.com/sessions/${sessionId}/accounts/${accountId}/transactions?booking_status=booked`,
-            `https://api.enablebanking.com/sessions/${sessionId}/accounts/${accountId}/transactions?booking_status=BOOK`,
-            `https://api.enablebanking.com/sessions/${sessionId}/accounts/${accountId}/transactions?booking_status=both`,
-            `https://api.enablebanking.com/sessions/${sessionId}/accounts/${accountId}/transactions?date_from=${dateFromIso}&date_to=${dateToIso}`,
-            `https://api.enablebanking.com/sessions/${sessionId}/accounts/${accountId}/transactions?booking_status=booked&date_from=${dateFromIso}&date_to=${dateToIso}`,
-            `https://api.enablebanking.com/sessions/${sessionId}/accounts/${accountId}/transactions?booking_status=BOOK&date_from=${dateFromIso}&date_to=${dateToIso}`,
-            `https://api.enablebanking.com/sessions/${sessionId}/accounts/${accountId}/transactions?booking_status=both&date_from=${dateFromIso}&date_to=${dateToIso}`,
-          ]
-        : []),
-    ];
+    const candidates = this.buildEnableBankingTransactionCandidates(accountId, sessionId);
 
     let firstParsed: Record<string, unknown> | null = null;
 
@@ -518,6 +491,67 @@ export class FinanceService {
     }
 
     return firstParsed;
+  }
+
+  private buildEnableBankingTransactionCandidates(accountId: string, _sessionId: string | null): string[] {
+    const today = new Date();
+    const dateFrom = new Date(today);
+    dateFrom.setFullYear(today.getFullYear() - 1);
+    const dateFromIso = dateFrom.toISOString().slice(0, 10);
+    const dateToIso = today.toISOString().slice(0, 10);
+
+    // Enable Banking's ASPSPs rate-limit accesses per consent (PSD2 access quota,
+    // commonly a handful per day). Only the canonical endpoint is used so a single
+    // sync/debug call spends at most one access per account instead of exhausting
+    // the quota by probing many URL variants.
+    return [
+      `https://api.enablebanking.com/accounts/${accountId}/transactions?date_from=${dateFromIso}&date_to=${dateToIso}`,
+    ];
+  }
+
+  private async probeEnableBankingTransactionEndpoints(
+    accountId: string,
+    sessionId: string,
+    jwt: string,
+  ): Promise<Array<{ url: string; status: number; keys: string[]; entryCount: number; preview: string; sample: Record<string, unknown> | null }>> {
+    const candidates = this.buildEnableBankingTransactionCandidates(accountId, sessionId);
+    const results: Array<{ url: string; status: number; keys: string[]; entryCount: number; preview: string; sample: Record<string, unknown> | null }> = [];
+
+    for (const url of candidates) {
+      try {
+        const response = await fetch(url, {
+          method: 'GET',
+          headers: {
+            Authorization: `Bearer ${jwt}`,
+            Accept: 'application/json',
+          },
+        });
+
+        const bodyText = await response.text();
+        const parsed = this.safeParseJson(bodyText);
+        const entries = parsed ? this.extractEnableBankingTransactionEntries(parsed) : [];
+
+        results.push({
+          url,
+          status: response.status,
+          keys: parsed ? Object.keys(parsed) : [],
+          entryCount: entries.length,
+          preview: bodyText.slice(0, 400),
+          sample: entries[0] ?? null,
+        });
+      } catch (error) {
+        results.push({
+          url,
+          status: 0,
+          keys: [],
+          entryCount: 0,
+          preview: error instanceof Error ? error.message : 'request failed',
+          sample: null,
+        });
+      }
+    }
+
+    return results;
   }
 
   private extractEnableBankingTransactionEntries(payload: Record<string, unknown> | null): Record<string, unknown>[] {
@@ -916,24 +950,37 @@ export class FinanceService {
 
     const jwt = this.createEnableBankingJwt(appId, privateKeyPem);
     const probes = await this.probeEnableBankingSessionEndpoints(sessionId, jwt);
+    const sessionProbe = probes.find((item) => item.url.endsWith(`/sessions/${sessionId}`));
+    const sessionParsed = sessionProbe?.preview ? this.safeParseJson(sessionProbe.preview) : null;
     const accountIds = await this.fetchEnableBankingAccountIds(sessionId, jwt);
-    const perAccount: Array<{ accountId: string; transactionCount: number; sample: Record<string, unknown> | null }> = [];
+    const perAccount: Array<{
+      accountId: string;
+      transactionCount: number;
+      sample: Record<string, unknown> | null;
+      transactionProbes: Array<{ url: string; status: number; keys: string[]; entryCount: number; preview: string; sample: Record<string, unknown> | null }>;
+    }> = [];
     let totalTransactions = 0;
 
     for (const accountId of accountIds) {
-      const payload = await this.fetchEnableBankingAccountTransactions(accountId, jwt);
-      const entries = this.extractEnableBankingTransactionEntries(payload);
-      totalTransactions += entries.length;
+      // A single probe call doubles as the actual fetch (one candidate URL) so
+      // debug-pull spends the same one access-per-account as a real sync.
+      const transactionProbes = await this.probeEnableBankingTransactionEndpoints(accountId, sessionId, jwt);
+      const entryCount = transactionProbes.reduce((sum, probe) => sum + probe.entryCount, 0);
+      const sample = transactionProbes.find((probe) => probe.sample)?.sample ?? null;
+      totalTransactions += entryCount;
       perAccount.push({
         accountId,
-        transactionCount: entries.length,
-        sample: entries[0] ?? null,
+        transactionCount: entryCount,
+        sample,
+        transactionProbes,
       });
     }
 
     return {
       ok: true,
       sessionId,
+      sessionAccess: sessionParsed?.access ?? null,
+      sessionStatus: sessionParsed?.status ?? null,
       accountCount: accountIds.length,
       totalTransactions,
       perAccount,

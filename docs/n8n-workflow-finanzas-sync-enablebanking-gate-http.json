@@ -28,7 +28,7 @@
             {
               "id": "f5f6dc14-b221-4939-a57c-f106459cc631",
               "leftValue": "={{$json.headers[\"x-api-key\"]}}",
-              "rightValue": "finanzas-n8n-trigger-local",
+              "rightValue": "finanzas-n8n-trigger-prod",
               "operator": {
                 "type": "string",
                 "operation": "equals"
