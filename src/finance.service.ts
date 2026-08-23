@@ -197,14 +197,36 @@ export class FinanceService {
     });
     const { _id, ...createdRecord } = record.toObject();
 
+    if (!latestSessionId) {
+      await this.syncHistoryModel.updateOne(
+        { id: createdRecord.id },
+        { $set: { status: 'error' } },
+      );
+
+      return {
+        id: createdRecord.id,
+        provider,
+        status: 'error',
+        syncAt: createdRecord.syncAt,
+        message: 'No hay sesion bancaria activa. Conecta el banco primero.',
+      };
+    }
+
+    await this.syncHistoryModel.updateOne(
+      { id: createdRecord.id },
+      { $set: { status: 'running' } },
+    );
+
+    void this.syncTransactionsFromEnableBanking(createdRecord.id, latestSessionId);
+
     const n8nWebhookUrl = process.env.N8N_SYNC_WEBHOOK_URL;
     if (!n8nWebhookUrl) {
       return {
         id: createdRecord.id,
         provider,
-        status: 'queued',
+        status: 'running',
         syncAt: createdRecord.syncAt,
-        message: 'Sincronización programada',
+        message: 'Sincronización iniciada',
       };
     }
 
@@ -231,24 +253,14 @@ export class FinanceService {
       });
 
       if (!response.ok) {
-        await this.syncHistoryModel.updateOne(
-          { id: createdRecord.id },
-          { $set: { status: 'error' } },
-        );
-
         return {
           id: createdRecord.id,
           provider,
-          status: 'error',
+          status: 'running',
           syncAt: createdRecord.syncAt,
-          message: `Webhook n8n devolvio ${response.status}`,
+          message: `Sincronización iniciada (n8n devolvio ${response.status})`,
         };
       }
-
-      await this.syncHistoryModel.updateOne(
-        { id: createdRecord.id },
-        { $set: { status: 'running' } },
-      );
 
       return {
         id: createdRecord.id,
@@ -258,19 +270,264 @@ export class FinanceService {
         message: 'Sincronización enviada a n8n',
       };
     } catch {
-      await this.syncHistoryModel.updateOne(
-        { id: createdRecord.id },
-        { $set: { status: 'error' } },
-      );
-
       return {
         id: createdRecord.id,
         provider,
-        status: 'error',
+        status: 'running',
         syncAt: createdRecord.syncAt,
-        message: 'No se pudo contactar con n8n',
+        message: 'Sincronización iniciada (n8n no disponible)',
       };
     }
+  }
+
+  private async syncTransactionsFromEnableBanking(syncId: string, sessionId: string): Promise<void> {
+    try {
+      const imported = await this.pullEnableBankingTransactions(sessionId);
+      await this.syncHistoryModel.updateOne(
+        { id: syncId },
+        { $set: { status: 'success' } },
+      );
+
+      if (imported > 0) {
+        return;
+      }
+    } catch {
+      await this.syncHistoryModel.updateOne(
+        { id: syncId },
+        { $set: { status: 'error' } },
+      );
+    }
+  }
+
+  private async pullEnableBankingTransactions(sessionId: string): Promise<number> {
+    const appId = process.env.ENABLE_BANKING_APP_ID;
+    const privateKeyPem = this.getEnableBankingPrivateKeyPem();
+    if (!appId || !privateKeyPem) {
+      throw new Error('Enable Banking credentials missing for sync');
+    }
+
+    const jwt = this.createEnableBankingJwt(appId, privateKeyPem);
+    const accountIds = await this.fetchEnableBankingAccountIds(sessionId, jwt);
+    if (accountIds.length === 0) {
+      return 0;
+    }
+
+    const accounts = await this.getAccounts();
+    const defaultAccountId = accounts[0]?.id ?? 'acc_001';
+    const transactions: CreateTransactionDto[] = [];
+
+    for (const accountId of accountIds) {
+      const payload = await this.fetchEnableBankingAccountTransactions(accountId, jwt);
+      const rawEntries = this.extractEnableBankingTransactionEntries(payload);
+
+      for (const rawEntry of rawEntries) {
+        const mapped = this.mapEnableBankingEntryToTransaction(rawEntry, {
+          fallbackAccountId: defaultAccountId,
+          sourceAccountId: accountId,
+          sessionId,
+        });
+
+        if (mapped) {
+          transactions.push(mapped);
+        }
+      }
+    }
+
+    if (transactions.length === 0) {
+      return 0;
+    }
+
+    const imported = await this.importTransactions({
+      source: 'bank',
+      transactions,
+    });
+
+    return imported.imported;
+  }
+
+  private async fetchEnableBankingAccountIds(sessionId: string, jwt: string): Promise<string[]> {
+    const candidates = [
+      `https://api.enablebanking.com/sessions/${sessionId}/accounts`,
+      `https://api.enablebanking.com/accounts?session_id=${encodeURIComponent(sessionId)}`,
+      `https://api.enablebanking.com/sessions/${sessionId}`,
+    ];
+
+    for (const url of candidates) {
+      const response = await fetch(url, {
+        method: 'GET',
+        headers: {
+          Authorization: `Bearer ${jwt}`,
+          Accept: 'application/json',
+        },
+      });
+
+      if (!response.ok) {
+        continue;
+      }
+
+      const bodyText = await response.text();
+      const parsed = this.safeParseJson(bodyText);
+      const accountIds = this.extractEnableBankingAccountIds(parsed);
+      if (accountIds.length > 0) {
+        return accountIds;
+      }
+    }
+
+    return [];
+  }
+
+  private extractEnableBankingAccountIds(payload: Record<string, unknown> | null): string[] {
+    if (!payload) {
+      return [];
+    }
+
+    const accountLists = [
+      payload.accounts,
+      payload.data,
+      (payload.session as Record<string, unknown> | undefined)?.accounts,
+    ];
+
+    const ids: string[] = [];
+    for (const list of accountLists) {
+      if (!Array.isArray(list)) {
+        continue;
+      }
+
+      for (const item of list) {
+        if (!item || typeof item !== 'object') {
+          continue;
+        }
+
+        const account = item as Record<string, unknown>;
+        const candidate = [account.id, account.accountId, account.account_id]
+          .find((value): value is string => typeof value === 'string' && value.length > 0);
+
+        if (candidate) {
+          ids.push(candidate);
+        }
+      }
+    }
+
+    return [...new Set(ids)];
+  }
+
+  private async fetchEnableBankingAccountTransactions(accountId: string, jwt: string): Promise<Record<string, unknown> | null> {
+    const candidates = [
+      `https://api.enablebanking.com/accounts/${accountId}/transactions`,
+      `https://api.enablebanking.com/accounts/${accountId}/transactions?booking_status=booked`,
+    ];
+
+    for (const url of candidates) {
+      const response = await fetch(url, {
+        method: 'GET',
+        headers: {
+          Authorization: `Bearer ${jwt}`,
+          Accept: 'application/json',
+        },
+      });
+
+      if (!response.ok) {
+        continue;
+      }
+
+      const bodyText = await response.text();
+      const parsed = this.safeParseJson(bodyText);
+      if (parsed) {
+        return parsed;
+      }
+    }
+
+    return null;
+  }
+
+  private extractEnableBankingTransactionEntries(payload: Record<string, unknown> | null): Record<string, unknown>[] {
+    if (!payload) {
+      return [];
+    }
+
+    const transactionsNode = payload.transactions as Record<string, unknown> | undefined;
+    const candidates = [
+      payload.booked,
+      payload.pending,
+      payload.data,
+      payload.transactions,
+      transactionsNode?.booked,
+      transactionsNode?.pending,
+      transactionsNode?.transactions,
+    ];
+
+    const entries: Record<string, unknown>[] = [];
+    for (const candidate of candidates) {
+      if (!Array.isArray(candidate)) {
+        continue;
+      }
+
+      for (const item of candidate) {
+        if (item && typeof item === 'object') {
+          entries.push(item as Record<string, unknown>);
+        }
+      }
+    }
+
+    return entries;
+  }
+
+  private mapEnableBankingEntryToTransaction(
+    entry: Record<string, unknown>,
+    context: { fallbackAccountId: string; sourceAccountId: string; sessionId: string },
+  ): CreateTransactionDto | null {
+    const amountInfo = (entry.transactionAmount as Record<string, unknown> | undefined)
+      ?? (entry.amount as Record<string, unknown> | undefined);
+    const rawAmount = amountInfo?.amount ?? entry.amount;
+    const numericAmount = Number(rawAmount);
+    if (!Number.isFinite(numericAmount) || numericAmount === 0) {
+      return null;
+    }
+
+    const indicator = String(entry.creditDebitIndicator ?? '').toUpperCase();
+    const isIncome = indicator === 'CRDT' || numericAmount > 0;
+    const type: 'income' | 'expense' = isIncome ? 'income' : 'expense';
+    const amount = Math.abs(numericAmount);
+
+    const dateCandidate = [
+      entry.bookingDate,
+      entry.valueDate,
+      entry.date,
+      entry.booking_date,
+      entry.value_date,
+    ].find((value): value is string => typeof value === 'string' && value.length >= 10);
+    const date = (dateCandidate ?? new Date().toISOString()).slice(0, 10);
+
+    const descriptionCandidate = [
+      entry.remittanceInformationUnstructured,
+      entry.remittanceInformationStructured,
+      entry.additionalInformation,
+      entry.creditorName,
+      entry.debtorName,
+      entry.description,
+    ].find((value): value is string => typeof value === 'string' && value.trim().length > 0);
+
+    const externalIdCandidate = [
+      entry.transactionId,
+      entry.internalTransactionId,
+      entry.id,
+      entry.entryReference,
+    ].find((value): value is string => typeof value === 'string' && value.length > 0);
+
+    const externalId = externalIdCandidate
+      ? `${context.sessionId}:${context.sourceAccountId}:${externalIdCandidate}`
+      : `${context.sessionId}:${context.sourceAccountId}:${date}:${amount}:${type}`;
+
+    return {
+      accountId: context.fallbackAccountId,
+      categoryId: type === 'income' ? 'cat_002' : 'cat_001',
+      date,
+      amount,
+      description: descriptionCandidate ?? 'Movimiento Open Banking',
+      type,
+      source: 'bank',
+      externalId,
+    };
   }
 
   async importTransactions(dto?: ImportTransactionsDto, apiKey?: string) {
