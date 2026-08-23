@@ -387,7 +387,7 @@ export class FinanceService {
 
   async getEnableBankingConnectUrl() {
     const appId = process.env.ENABLE_BANKING_APP_ID;
-    const redirectUrl = this.getEnableBankingRedirectUrl();
+    const redirectCandidates = this.getEnableBankingRedirectUrlCandidates();
     const privateKeyPem = this.getEnableBankingPrivateKeyPem();
     const country = process.env.ENABLE_BANKING_COUNTRY || 'ES';
     const targetBank = (process.env.ENABLE_BANKING_TARGET_BANKS || 'Bankinter')
@@ -395,7 +395,7 @@ export class FinanceService {
       .map((item) => item.trim())
       .filter(Boolean)[0] || 'Bankinter';
 
-    if (!appId || !redirectUrl || !privateKeyPem) {
+    if (!appId || redirectCandidates.length === 0 || !privateKeyPem) {
       return {
         configured: false,
         error: 'Missing ENABLE_BANKING_APP_ID, ENABLE_BANKING_PRIVATE_KEY_PEM/PATH or ENABLE_BANKING_REDIRECT_URL',
@@ -410,52 +410,46 @@ export class FinanceService {
     });
 
     const jwt = this.createEnableBankingJwt(appId, privateKeyPem);
-    const validUntil = new Date(Date.now() + 1000 * 60 * 60 * 24 * 90).toISOString();
-    const upstreamResponse = await fetch('https://api.enablebanking.com/auth', {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${jwt}`,
-        'Content-Type': 'application/json',
-        Accept: 'application/json',
-      },
-      body: JSON.stringify({
-        access: {
-          balances: true,
-          transactions: true,
-          valid_until: validUntil,
-        },
-        aspsp: {
-          country,
-          name: targetBank,
-        },
-        psu_type: 'personal',
-        redirect_url: redirectUrl,
+    let resolvedAuthUrl: string | null = null;
+    let selectedRedirectUrl: string | null = null;
+    let lastStatus = 0;
+    let lastErrorDetail = '';
+
+    for (const redirectUrl of redirectCandidates) {
+      const attempt = await this.requestEnableBankingConnectUrl({
+        appId,
+        jwt,
+        country,
+        targetBank,
+        redirectUrl,
         state,
-      }),
-    });
+      });
 
-    const bodyText = await upstreamResponse.text();
-    const parsedBody = this.safeParseJson(bodyText);
+      if (attempt.authUrl) {
+        resolvedAuthUrl = attempt.authUrl;
+        selectedRedirectUrl = redirectUrl;
+        break;
+      }
 
-    const resolvedAuthUrl = parsedBody
-      ? [parsedBody.url, parsedBody.authUrl, parsedBody.auth_url, parsedBody.authorizationUrl]
-          .find((value): value is string => typeof value === 'string' && value.startsWith('http'))
-      : null;
+      lastStatus = attempt.status;
+      lastErrorDetail = attempt.errorDetail;
+    }
 
-    if (!resolvedAuthUrl) {
-      const errorDetail = parsedBody ? JSON.stringify(parsedBody) : bodyText;
+    if (!resolvedAuthUrl || !selectedRedirectUrl) {
       return {
         configured: false,
-        error: `Enable Banking connect URL request failed (${upstreamResponse.status})`,
-        response: errorDetail,
+        error: `Enable Banking connect URL request failed (${lastStatus || 'unknown'})`,
+        response: lastErrorDetail || 'No auth URL returned by provider',
       };
     }
+
+    await this.updateEnableBankingState({ pendingRedirectUrl: selectedRedirectUrl });
 
     return {
       configured: true,
       authUrl: resolvedAuthUrl,
       state,
-      redirectUrl,
+      redirectUrl: selectedRedirectUrl,
       country,
       bank: targetBank,
     };
@@ -678,7 +672,12 @@ export class FinanceService {
     raw: Record<string, unknown> | string;
   }> {
     const appId = process.env.ENABLE_BANKING_APP_ID;
-    const redirectUrl = this.getEnableBankingRedirectUrl();
+    const existingState = await this.getEnableBankingState();
+    const stateRedirectUrl = existingState.pendingRedirectUrl;
+    const redirectUrl =
+      typeof stateRedirectUrl === 'string' && stateRedirectUrl.length > 0
+        ? stateRedirectUrl
+        : this.getEnableBankingRedirectUrl();
     const privateKeyPem = this.getEnableBankingPrivateKeyPem();
 
     if (!appId || !redirectUrl || !privateKeyPem) {
@@ -763,6 +762,85 @@ export class FinanceService {
 
     // Safe production fallback when Render env is temporarily missing.
     return 'https://finanzas-back-yzbs.onrender.com/api/enablebanking/callback';
+  }
+
+  private getEnableBankingRedirectUrlCandidates(): string[] {
+    const candidates = [
+      process.env.ENABLE_BANKING_REDIRECT_URL?.trim() ?? '',
+      'https://finanzas-back-yzbs.onrender.com/api/enablebanking/callback',
+      'https://finanzas-back-yzbs.onrender.com/api/enable-banking/callback',
+    ].filter((value) => value.length > 0);
+
+    return [...new Set(candidates)];
+  }
+
+  private async requestEnableBankingConnectUrl(input: {
+    appId: string;
+    jwt: string;
+    country: string;
+    targetBank: string;
+    redirectUrl: string;
+    state: string;
+  }): Promise<{ authUrl: string | null; status: number; errorDetail: string }> {
+    const validUntil = new Date(Date.now() + 1000 * 60 * 60 * 24 * 90).toISOString();
+    let upstreamResponse = await fetch('https://api.enablebanking.com/auth', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${input.jwt}`,
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+      },
+      body: JSON.stringify({
+        access: {
+          balances: true,
+          transactions: true,
+          valid_until: validUntil,
+        },
+        aspsp: {
+          country: input.country,
+          name: input.targetBank,
+        },
+        psu_type: 'personal',
+        redirect_url: input.redirectUrl,
+        state: input.state,
+      }),
+    });
+
+    if (upstreamResponse.status === 405) {
+      const params = new URLSearchParams({
+        response_type: 'code',
+        client_id: input.appId,
+        redirect_uri: input.redirectUrl,
+        state: input.state,
+        country: input.country,
+      });
+
+      upstreamResponse = await fetch(`https://api.enablebanking.com/auth?${params.toString()}`, {
+        method: 'GET',
+        headers: {
+          Authorization: `Bearer ${input.jwt}`,
+          Accept: 'application/json',
+        },
+        redirect: 'manual',
+      });
+    }
+
+    const locationHeader = upstreamResponse.headers.get('location');
+    const bodyText = await upstreamResponse.text();
+    const parsedBody = this.safeParseJson(bodyText);
+    const resolvedAuthUrl = [
+      locationHeader,
+      parsedBody?.url,
+      parsedBody?.authUrl,
+      parsedBody?.auth_url,
+      parsedBody?.authorizationUrl,
+    ].find((value): value is string => typeof value === 'string' && value.startsWith('http')) ?? null;
+
+    return {
+      authUrl: resolvedAuthUrl,
+      status: upstreamResponse.status,
+      errorDetail: parsedBody ? JSON.stringify(parsedBody) : bodyText,
+    };
   }
 
   private async getEnableBankingState(): Promise<Record<string, unknown>> {
