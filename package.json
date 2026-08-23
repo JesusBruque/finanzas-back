@@ -11,7 +11,7 @@
     "start": "nest start",
     "start:dev": "nest start --watch",
     "start:debug": "nest start --debug --watch",
-    "start:prod": "node dist/main",
+    "start:prod": "node dist/src/main.js",
     "enablebanking:check": "node scripts/enable-banking-check.mjs",
     "enablebanking:banks": "node scripts/enable-banking-target-banks.mjs",
     "enablebanking:banks:json": "node scripts/enable-banking-target-banks.mjs --json",
