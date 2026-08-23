@@ -1,5 +1,14 @@
 import { Type } from 'class-transformer';
-import { IsArray, IsIn, IsNumber, IsOptional, IsString, ValidateNested } from 'class-validator';
+import {
+  IsArray,
+  IsDateString,
+  IsIn,
+  IsNumber,
+  IsOptional,
+  IsPositive,
+  IsString,
+  ValidateNested,
+} from 'class-validator';
 
 export class CategoryDto {
   name: string;
@@ -28,12 +37,28 @@ export class CreateAccountDto {
 }
 
 export class CreateTransactionDto {
+  @IsString()
   accountId: string;
+
+  @IsString()
   categoryId: string;
+
+  @IsDateString()
   date: string;
+
+  @IsNumber()
+  @IsPositive()
   amount: number;
+
+  @IsString()
   description: string;
+
+  @IsIn(['income', 'expense'])
   type: 'income' | 'expense';
+
+  @IsOptional()
+  @IsString()
+  externalId?: string;
 
   @IsOptional()
   @IsIn(['manual', 'bank', 'n8n'])

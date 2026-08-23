@@ -1,4 +1,4 @@
-import { Body, Controller, Delete, Get, Param, Post, Put, Query } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Headers, Param, Post, Put, Query } from '@nestjs/common';
 import { FinanceService } from './finance.service';
 import {
   BankSyncDto,
@@ -64,8 +64,11 @@ export class Block1Controller {
   }
 
   @Post('transactions/import')
-  importTransactions(@Body() dto: ImportTransactionsDto) {
-    return this.financeService.importTransactions(dto);
+  importTransactions(
+    @Body() dto: ImportTransactionsDto,
+    @Headers('x-api-key') apiKey?: string,
+  ) {
+    return this.financeService.importTransactions(dto, apiKey);
   }
 
   @Get('dashboard')
@@ -94,5 +97,50 @@ export class Block1Controller {
   @Get('sync-history')
   getSyncHistory() {
     return this.financeService.getSyncHistory();
+  }
+
+  @Get('enablebanking/target-banks')
+  getEnableBankingTargetBanks() {
+    return this.financeService.getEnableBankingTargetBanks();
+  }
+
+  @Get('enablebanking/connect-url')
+  getEnableBankingConnectUrl() {
+    return this.financeService.getEnableBankingConnectUrl();
+  }
+
+  @Get('enablebanking/callback')
+  handleEnableBankingCallback(
+    @Query('code') code?: string,
+    @Query('state') state?: string,
+    @Query('error') error?: string,
+    @Query('error_description') errorDescription?: string,
+  ) {
+    return this.financeService.handleEnableBankingCallback({
+      code,
+      state,
+      error,
+      errorDescription,
+    });
+  }
+
+  @Get('enable-banking/callback')
+  handleEnableBankingCallbackAlias(
+    @Query('code') code?: string,
+    @Query('state') state?: string,
+    @Query('error') error?: string,
+    @Query('error_description') errorDescription?: string,
+  ) {
+    return this.financeService.handleEnableBankingCallback({
+      code,
+      state,
+      error,
+      errorDescription,
+    });
+  }
+
+  @Get('enablebanking/session-status')
+  getEnableBankingSessionStatus() {
+    return this.financeService.getEnableBankingSessionStatus();
   }
 }

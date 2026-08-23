@@ -1,0 +1,233 @@
+{
+  "name": "Finanzas - Enable Banking Real Check (n8n local + Render)",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "finanzas-sync",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "c2e6a7e8-e66b-4ea2-a1f5-26ffb727f555",
+      "name": "Webhook Trigger",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [240, 300],
+      "webhookId": "finanzas-sync"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "f5f6dc14-b221-4939-a57c-f106459cc631",
+              "leftValue": "={{$json.headers[\"x-api-key\"]}}",
+              "rightValue": "finanzas-n8n-trigger-local",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "cd18fdb9-08fa-4355-a220-ac45d402472f",
+      "name": "IF Trigger Token Valid",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [480, 300]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "https://finanzas-back-yzbs.onrender.com/api/enablebanking/session-status",
+        "sendHeaders": false,
+        "options": {}
+      },
+      "id": "72f6b959-f8e9-4dd7-9495-e06d5c4f2a10",
+      "name": "Check Session Status HTTP",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [720, 220]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "https://finanzas-back-yzbs.onrender.com/api/enablebanking/target-banks",
+        "sendHeaders": false,
+        "options": {}
+      },
+      "id": "a4d88cc5-afb5-414f-bef3-74ac1ea84508",
+      "name": "Check Target Banks HTTP",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [960, 220]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "b9f7d7cc-9ee4-465e-a840-a5197425c928",
+              "name": "frontendUrl",
+              "value": "https://finanzas-mu-eight.vercel.app",
+              "type": "string"
+            },
+            {
+              "id": "6f5b9ee9-a70e-49f1-a5ab-cf3d81455434",
+              "name": "backendUrl",
+              "value": "https://finanzas-back-yzbs.onrender.com",
+              "type": "string"
+            },
+            {
+              "id": "59caeb14-c451-4a4c-8f69-0e2279f53a9e",
+              "name": "sessionStatus",
+              "value": "={{$item(0).$node[\"Check Session Status HTTP\"].json}}",
+              "type": "object"
+            },
+            {
+              "id": "53f8487b-d506-40d6-ba5a-c92be90f7541",
+              "name": "banks",
+              "value": "={{$json}}",
+              "type": "object"
+            },
+            {
+              "id": "8d95335c-a928-460e-84af-4cf08768927b",
+              "name": "allTargetsFound",
+              "value": "={{$json.allTargetsFound === true}}",
+              "type": "boolean"
+            },
+            {
+              "id": "85a5a872-7fd3-48f1-a66a-4df754332f8b",
+              "name": "hasSession",
+              "value": "={{!!$item(0).$node[\"Check Session Status HTTP\"].json.latestSessionId}}",
+              "type": "boolean"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "10658ae6-5e66-4443-ad35-6c1d5b15e45f",
+      "name": "Build Real Response",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [1200, 220]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "b4f0fd26-37c9-4c43-af29-7e735f63e3f2",
+              "leftValue": "={{$json.allTargetsFound}}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "94ddf18d-9b72-4aef-bff6-6069bca35913",
+      "name": "IF Target Banks Available",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [1440, 220]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{$json}}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "0637ea17-3f4a-46de-a2ef-9e648eae6e5a",
+      "name": "Respond Success",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [1680, 140]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { \"error\": \"target banks not available for this Enable Banking account\", \"details\": $json } }}",
+        "options": {
+          "responseCode": 412
+        }
+      },
+      "id": "b405ad4f-e719-43f5-906a-f9f6f9938cd4",
+      "name": "Respond Banks Missing",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [1680, 320]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "{\"error\":\"invalid n8n trigger token\"}",
+        "options": {
+          "responseCode": 401
+        }
+      },
+      "id": "c5c051fc-f4d9-4133-a2ea-dd6c3509e8cd",
+      "name": "Respond Unauthorized",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [720, 420]
+    }
+  ],
+  "connections": {
+    "Webhook Trigger": {
+      "main": [[{ "node": "IF Trigger Token Valid", "type": "main", "index": 0 }]]
+    },
+    "IF Trigger Token Valid": {
+      "main": [
+        [{ "node": "Check Session Status HTTP", "type": "main", "index": 0 }],
+        [{ "node": "Respond Unauthorized", "type": "main", "index": 0 }]
+      ]
+    },
+    "Check Session Status HTTP": {
+      "main": [[{ "node": "Check Target Banks HTTP", "type": "main", "index": 0 }]]
+    },
+    "Check Target Banks HTTP": {
+      "main": [[{ "node": "Build Real Response", "type": "main", "index": 0 }]]
+    },
+    "Build Real Response": {
+      "main": [[{ "node": "IF Target Banks Available", "type": "main", "index": 0 }]]
+    },
+    "IF Target Banks Available": {
+      "main": [
+        [{ "node": "Respond Success", "type": "main", "index": 0 }],
+        [{ "node": "Respond Banks Missing", "type": "main", "index": 0 }]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {},
+  "active": false,
+  "meta": {
+    "instanceId": "finanzas-local-real-check"
+  },
+  "id": "finanzas-enablebanking-real-check-local-n8n"
+}

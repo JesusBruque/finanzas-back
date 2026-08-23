@@ -1,6 +1,8 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import { Injectable, NotFoundException, UnauthorizedException } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model } from 'mongoose';
+import fs from 'node:fs';
+import crypto from 'node:crypto';
 import {
   BankSyncDto,
   CreateAccountDto,
@@ -141,7 +143,18 @@ export class FinanceService {
 
     const amount = Number(dto.amount) || 0;
     const type = dto.type ?? (category.type === 'income' ? 'income' : 'expense');
-    const transaction = await this.transactionModel.create({
+    const transactionPayload: {
+      id: string;
+      accountId: string;
+      categoryId: string;
+      date: string;
+      amount: number;
+      description: string;
+      type: 'income' | 'expense';
+      source: 'manual' | 'bank' | 'n8n';
+      createdAt: string;
+      externalId?: string;
+    } = {
       id: `txn_${Date.now()}`,
       accountId: dto.accountId,
       categoryId: dto.categoryId,
@@ -151,7 +164,13 @@ export class FinanceService {
       type,
       source: dto.source ?? 'manual',
       createdAt: new Date().toISOString(),
-    });
+    };
+
+    if (dto.externalId) {
+      transactionPayload.externalId = dto.externalId;
+    }
+
+    const transaction = await this.transactionModel.create(transactionPayload);
 
     if (type === 'income') {
       await this.accountModel.updateOne({ id: dto.accountId }, { $inc: { balance: amount } });
@@ -164,37 +183,132 @@ export class FinanceService {
 
   async triggerBankSync(dto?: BankSyncDto) {
     const provider = dto?.provider ?? 'open-banking';
+    const syncAt = new Date().toISOString();
+    const enableBankingState = await this.getEnableBankingState();
+    const latestSessionId =
+      typeof enableBankingState.latestSessionId === 'string'
+        ? enableBankingState.latestSessionId
+        : null;
     const record = await this.syncHistoryModel.create({
       id: `sync_${Date.now()}`,
       provider,
       status: 'queued',
-      syncAt: new Date().toISOString(),
+      syncAt,
     });
     const { _id, ...createdRecord } = record.toObject();
 
-    return {
-      id: createdRecord.id,
-      provider,
-      status: 'queued',
-      syncAt: createdRecord.syncAt,
-      message: 'Sincronización programada',
-    };
+    const n8nWebhookUrl = process.env.N8N_SYNC_WEBHOOK_URL;
+    if (!n8nWebhookUrl) {
+      return {
+        id: createdRecord.id,
+        provider,
+        status: 'queued',
+        syncAt: createdRecord.syncAt,
+        message: 'Sincronización programada',
+      };
+    }
+
+    try {
+      const headers: Record<string, string> = {
+        'content-type': 'application/json',
+      };
+      const n8nToken = process.env.N8N_SYNC_WEBHOOK_TOKEN;
+      if (n8nToken) {
+        headers['x-api-key'] = n8nToken;
+      }
+
+      const response = await fetch(n8nWebhookUrl, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          syncId: createdRecord.id,
+          provider,
+          requestedAt: syncAt,
+          enableBanking: {
+            sessionId: latestSessionId,
+          },
+        }),
+      });
+
+      if (!response.ok) {
+        await this.syncHistoryModel.updateOne(
+          { id: createdRecord.id },
+          { $set: { status: 'error' } },
+        );
+
+        return {
+          id: createdRecord.id,
+          provider,
+          status: 'error',
+          syncAt: createdRecord.syncAt,
+          message: `Webhook n8n devolvio ${response.status}`,
+        };
+      }
+
+      await this.syncHistoryModel.updateOne(
+        { id: createdRecord.id },
+        { $set: { status: 'running' } },
+      );
+
+      return {
+        id: createdRecord.id,
+        provider,
+        status: 'running',
+        syncAt: createdRecord.syncAt,
+        message: 'Sincronización enviada a n8n',
+      };
+    } catch {
+      await this.syncHistoryModel.updateOne(
+        { id: createdRecord.id },
+        { $set: { status: 'error' } },
+      );
+
+      return {
+        id: createdRecord.id,
+        provider,
+        status: 'error',
+        syncAt: createdRecord.syncAt,
+        message: 'No se pudo contactar con n8n',
+      };
+    }
   }
 
-  async importTransactions(dto?: ImportTransactionsDto) {
+  async importTransactions(dto?: ImportTransactionsDto, apiKey?: string) {
+    const ingestApiKey = process.env.BANK_INGEST_API_KEY;
+    if (ingestApiKey && apiKey !== ingestApiKey) {
+      throw new UnauthorizedException('Invalid import API key');
+    }
+
     const source = dto?.source ?? 'n8n';
     const items = dto?.transactions ?? [];
+    let imported = 0;
+    let skipped = 0;
 
     for (const transactionDto of items) {
+      const externalId = transactionDto.externalId?.trim();
+      if (externalId) {
+        const existing = await this.transactionModel.findOne({
+          source: transactionDto.source ?? source,
+          externalId,
+        });
+        if (existing) {
+          skipped += 1;
+          continue;
+        }
+      }
+
       await this.createTransaction({
         ...transactionDto,
         type: transactionDto.type ?? 'expense',
         source: transactionDto.source ?? source,
+        externalId,
       });
+      imported += 1;
     }
 
     return {
-      imported: items.length,
+      imported,
+      skipped,
       source,
     };
   }
@@ -205,6 +319,188 @@ export class FinanceService {
       ...entry,
       id: String(entry.id),
     }));
+  }
+
+  async getEnableBankingTargetBanks() {
+    const appId = process.env.ENABLE_BANKING_APP_ID;
+    const privateKeyPem = this.getEnableBankingPrivateKeyPem();
+    const country = process.env.ENABLE_BANKING_COUNTRY || 'ES';
+    const targets = (process.env.ENABLE_BANKING_TARGET_BANKS || 'Unicaja,Caja Rural del Sur,Bankinter')
+      .split(',')
+      .map((item) => item.trim())
+      .filter(Boolean);
+
+    if (!appId || !privateKeyPem) {
+      return {
+        country,
+        totalAspsps: 0,
+        allTargetsFound: false,
+        targets: targets.map((target) => ({ target, found: false, matches: [] as string[] })),
+        sampleAspsps: [] as string[],
+        error: 'Enable Banking is not configured in backend environment',
+      };
+    }
+
+    const jwt = this.createEnableBankingJwt(appId, privateKeyPem);
+
+    const response = await fetch(`https://api.enablebanking.com/aspsps?country=${country}`, {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${jwt}`,
+        Accept: 'application/json',
+      },
+    });
+
+    const bodyText = await response.text();
+    if (!response.ok) {
+      return {
+        country,
+        totalAspsps: 0,
+        allTargetsFound: false,
+        targets: targets.map((target) => ({ target, found: false, matches: [] as string[] })),
+        sampleAspsps: [] as string[],
+        error: `Enable Banking request failed with ${response.status}`,
+        response: bodyText,
+      };
+    }
+
+    const data = JSON.parse(bodyText) as { aspsps?: Array<{ name?: string }> };
+    const names = (data.aspsps ?? []).map((item) => item?.name).filter((name): name is string => Boolean(name));
+    const results = targets.map((target) => {
+      const matcher = this.buildTargetMatcher(target);
+      const matches = names.filter(matcher);
+      return {
+        target,
+        found: matches.length > 0,
+        matches,
+      };
+    });
+
+    return {
+      country,
+      totalAspsps: names.length,
+      allTargetsFound: results.every((item) => item.found),
+      targets: results,
+      sampleAspsps: names.slice(0, 20),
+    };
+  }
+
+  async getEnableBankingConnectUrl() {
+    const appId = process.env.ENABLE_BANKING_APP_ID;
+    const redirectUrl = process.env.ENABLE_BANKING_REDIRECT_URL;
+    const country = process.env.ENABLE_BANKING_COUNTRY || 'ES';
+
+    if (!appId || !redirectUrl) {
+      return {
+        configured: false,
+        error: 'Missing ENABLE_BANKING_APP_ID or ENABLE_BANKING_REDIRECT_URL',
+      };
+    }
+
+    const state = crypto.randomUUID();
+    await this.updateEnableBankingState({
+      pendingState: state,
+      pendingStateCreatedAt: new Date().toISOString(),
+      lastExchangeError: null,
+    });
+
+    const params = new URLSearchParams({
+      response_type: 'code',
+      client_id: appId,
+      redirect_uri: redirectUrl,
+      state,
+      country,
+    });
+
+    return {
+      configured: true,
+      authUrl: `https://api.enablebanking.com/auth?${params.toString()}`,
+      state,
+      redirectUrl,
+      country,
+    };
+  }
+
+  async handleEnableBankingCallback(input: {
+    code?: string;
+    state?: string;
+    error?: string;
+    errorDescription?: string;
+  }) {
+    const receivedAt = new Date().toISOString();
+    const existingState = await this.getEnableBankingState();
+    const stateMatches = Boolean(
+      input.state &&
+      typeof existingState.pendingState === 'string' &&
+      input.state === existingState.pendingState,
+    );
+
+    let sessionId: string | null = null;
+    let exchangeResponse: Record<string, unknown> | string | null = null;
+    let exchangeError: string | null = null;
+
+    if (input.code) {
+      try {
+        const exchanged = await this.exchangeEnableBankingCode(input.code, input.state);
+        sessionId = exchanged.sessionId;
+        exchangeResponse = exchanged.raw;
+      } catch (error) {
+        exchangeError = error instanceof Error ? error.message : 'Unknown exchange error';
+      }
+    }
+
+    const patch: Record<string, unknown> = {
+      pendingState: null,
+      pendingStateCreatedAt: null,
+      lastCallbackAt: receivedAt,
+      lastCallback: {
+        codePresent: Boolean(input.code),
+        state: input.state ?? null,
+        error: input.error ?? null,
+        errorDescription: input.errorDescription ?? null,
+      },
+      stateMatches,
+      lastExchangeError: exchangeError,
+      lastExchangeResponse: exchangeResponse,
+    };
+
+    if (sessionId) {
+      patch.latestSessionId = sessionId;
+      patch.latestSessionAt = receivedAt;
+    }
+
+    const savedState = await this.updateEnableBankingState(patch);
+
+    return {
+      ok: !input.error && !exchangeError,
+      receivedAt,
+      stateMatches,
+      sessionId,
+      callbackError: input.error ?? null,
+      callbackErrorDescription: input.errorDescription ?? null,
+      exchangeError,
+      next: '/api/enablebanking/session-status',
+      stored: {
+        latestSessionId: savedState.latestSessionId ?? null,
+        latestSessionAt: savedState.latestSessionAt ?? null,
+      },
+    };
+  }
+
+  async getEnableBankingSessionStatus() {
+    const state = await this.getEnableBankingState();
+    return {
+      latestSessionId: typeof state.latestSessionId === 'string' ? state.latestSessionId : null,
+      latestSessionAt: typeof state.latestSessionAt === 'string' ? state.latestSessionAt : null,
+      pendingStateCreatedAt:
+        typeof state.pendingStateCreatedAt === 'string' ? state.pendingStateCreatedAt : null,
+      hasPendingState: Boolean(state.pendingState),
+      stateMatches: state.stateMatches === true,
+      lastExchangeError:
+        typeof state.lastExchangeError === 'string' ? state.lastExchangeError : null,
+      lastCallbackAt: typeof state.lastCallbackAt === 'string' ? state.lastCallbackAt : null,
+      lastCallback: (state.lastCallback as Record<string, unknown> | undefined) ?? null,
+    };
   }
 
   async getDashboard(month?: string, categoryId?: string) {
@@ -311,6 +607,185 @@ export class FinanceService {
     return 'expense';
   }
 
+  private createEnableBankingJwt(appId: string, privateKeyPem: string): string {
+    const iat = Math.floor(Date.now() / 1000);
+    const header = {
+      alg: 'RS256',
+      typ: 'JWT',
+      kid: appId,
+    };
+    const payload = {
+      iss: 'enablebanking.com',
+      aud: 'api.enablebanking.com',
+      iat,
+      exp: iat + 3600,
+    };
+
+    const encodedHeader = this.b64url(JSON.stringify(header));
+    const encodedPayload = this.b64url(JSON.stringify(payload));
+    const unsignedToken = `${encodedHeader}.${encodedPayload}`;
+
+    const signer = crypto.createSign('RSA-SHA256');
+    signer.update(unsignedToken);
+    signer.end();
+    const signature = signer.sign(privateKeyPem);
+
+    return `${unsignedToken}.${this.b64url(signature)}`;
+  }
+
+  private async exchangeEnableBankingCode(code: string, state?: string): Promise<{
+    sessionId: string | null;
+    raw: Record<string, unknown> | string;
+  }> {
+    const appId = process.env.ENABLE_BANKING_APP_ID;
+    const redirectUrl = process.env.ENABLE_BANKING_REDIRECT_URL;
+    const privateKeyPem = this.getEnableBankingPrivateKeyPem();
+
+    if (!appId || !redirectUrl || !privateKeyPem) {
+      throw new Error('Missing Enable Banking app configuration for session exchange');
+    }
+
+    const jwt = this.createEnableBankingJwt(appId, privateKeyPem);
+    const response = await fetch('https://api.enablebanking.com/sessions', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${jwt}`,
+        Accept: 'application/json',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        code,
+        state,
+        redirect_url: redirectUrl,
+      }),
+    });
+
+    const bodyText = await response.text();
+    const parsed = this.safeParseJson(bodyText);
+
+    if (!response.ok) {
+      const detail = parsed ? JSON.stringify(parsed) : bodyText;
+      throw new Error(`Enable Banking session exchange failed (${response.status}): ${detail}`);
+    }
+
+    const raw = parsed ?? bodyText;
+    const sessionId = this.extractSessionId(parsed);
+    return { sessionId, raw };
+  }
+
+  private extractSessionId(payload: Record<string, unknown> | null): string | null {
+    if (!payload) {
+      return null;
+    }
+
+    const fromSession = payload.session as Record<string, unknown> | undefined;
+    const candidates = [
+      payload.id,
+      payload.sessionId,
+      payload.session_id,
+      fromSession?.id,
+      fromSession?.sessionId,
+      fromSession?.session_id,
+    ];
+
+    const found = candidates.find((value): value is string => typeof value === 'string' && value.length > 0);
+    return found ?? null;
+  }
+
+  private safeParseJson(input: string): Record<string, unknown> | null {
+    try {
+      return JSON.parse(input) as Record<string, unknown>;
+    } catch {
+      return null;
+    }
+  }
+
+  private getEnableBankingPrivateKeyPem(): string | null {
+    const keyFromEnv = process.env.ENABLE_BANKING_PRIVATE_KEY_PEM?.trim();
+    if (keyFromEnv) {
+      // Support multiline PEM stored as escaped newlines in environment variables.
+      return keyFromEnv.replace(/\\n/g, '\n');
+    }
+
+    const keyPath = process.env.ENABLE_BANKING_PRIVATE_KEY_PATH;
+    if (keyPath && fs.existsSync(keyPath)) {
+      return fs.readFileSync(keyPath, 'utf8');
+    }
+
+    return null;
+  }
+
+  private async getEnableBankingState(): Promise<Record<string, unknown>> {
+    const settings = await this.getOrCreateSettings();
+    const integrationState = (settings.integrationState ?? {}) as Record<string, unknown>;
+    const enableBanking = integrationState.enableBanking;
+
+    if (enableBanking && typeof enableBanking === 'object' && !Array.isArray(enableBanking)) {
+      return enableBanking as Record<string, unknown>;
+    }
+
+    return {};
+  }
+
+  private async updateEnableBankingState(
+    patch: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> {
+    const settings = await this.getOrCreateSettings();
+    const integrationState = (settings.integrationState ?? {}) as Record<string, unknown>;
+    const currentEnableBanking = integrationState.enableBanking;
+    const currentState =
+      currentEnableBanking &&
+      typeof currentEnableBanking === 'object' &&
+      !Array.isArray(currentEnableBanking)
+        ? (currentEnableBanking as Record<string, unknown>)
+        : {};
+
+    const nextEnableBankingState = {
+      ...currentState,
+      ...patch,
+    };
+
+    await this.settingsModel.updateOne(
+      { key: 'global' },
+      {
+        $set: {
+          integrationState: {
+            ...integrationState,
+            enableBanking: nextEnableBankingState,
+          },
+        },
+      },
+      { upsert: true },
+    );
+
+    return nextEnableBankingState;
+  }
+
+  private b64url(input: string | Buffer): string {
+    return Buffer.from(input)
+      .toString('base64')
+      .replace(/=/g, '')
+      .replace(/\+/g, '-')
+      .replace(/\//g, '_');
+  }
+
+  private normalizeBankName(value: string): string {
+    return (value || '')
+      .toLowerCase()
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .replace(/[^a-z0-9]+/g, ' ')
+      .trim();
+  }
+
+  private buildTargetMatcher(target: string): (candidate: string) => boolean {
+    const tokens = this.normalizeBankName(target).split(' ').filter(Boolean);
+    return (candidate: string) => {
+      const normalizedCandidate = this.normalizeBankName(candidate);
+      return tokens.every((token) => normalizedCandidate.includes(token));
+    };
+  }
+
   private async ensureSeedData() {
     const accountCount = await this.accountModel.countDocuments();
     if (accountCount === 0) {
@@ -398,6 +873,7 @@ export class FinanceService {
       salaryJesus: 0,
       salaryAlba: 0,
       monthStartDay: 1,
+      integrationState: {},
       categories: [
         { name: 'Nomina', percentage: 100 },
         { name: 'Supermercado', percentage: 30 },

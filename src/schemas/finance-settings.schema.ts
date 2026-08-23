@@ -30,6 +30,9 @@ export class FinanceSettings {
 
   @Prop({ type: [FinanceCategorySchema], default: [] })
   categories: FinanceCategory[];
+
+  @Prop({ type: Object, default: {} })
+  integrationState: Record<string, unknown>;
 }
 
 export const FinanceSettingsSchema = SchemaFactory.createForClass(FinanceSettings);

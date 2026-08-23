@@ -8,3 +8,19 @@ services:
     envVars:
       - key: MONGODB_URI
         sync: false
+      - key: BANK_INGEST_API_KEY
+        sync: false
+      - key: N8N_SYNC_WEBHOOK_URL
+        sync: false
+      - key: N8N_SYNC_WEBHOOK_TOKEN
+        sync: false
+      - key: ENABLE_BANKING_APP_ID
+        sync: false
+      - key: ENABLE_BANKING_PRIVATE_KEY_PEM
+        sync: false
+      - key: ENABLE_BANKING_COUNTRY
+        value: ES
+      - key: ENABLE_BANKING_TARGET_BANKS
+        value: Banco de Sabadell,BBVA
+      - key: ENABLE_BANKING_REDIRECT_URL
+        sync: false

@@ -29,8 +29,15 @@ export class Transaction {
   @Prop({ required: true, enum: ['manual', 'bank', 'n8n'] })
   source: 'manual' | 'bank' | 'n8n';
 
+  @Prop({ required: false })
+  externalId?: string;
+
   @Prop({ required: true, default: () => new Date().toISOString() })
   createdAt: string;
 }
 
 export const TransactionSchema = SchemaFactory.createForClass(Transaction);
+TransactionSchema.index(
+  { source: 1, externalId: 1 },
+  { unique: true, partialFilterExpression: { externalId: { $type: 'string' } } },
+);

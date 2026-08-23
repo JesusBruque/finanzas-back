@@ -43,6 +43,10 @@ Thumbs.db
 .env.test.local
 .env.production.local
 
+# secrets and keys
+secrets/
+*.pem
+
 # temp
 .temp
 .tmp

@@ -53,6 +53,77 @@ describe('AppController (e2e)', () => {
       });
   });
 
+  it('/api/transactions/import requires API key when configured (POST)', async () => {
+    process.env.BANK_INGEST_API_KEY = 'test-ingest-key';
+
+    await request(app.getHttpServer())
+      .post('/api/transactions/import')
+      .send({
+        source: 'bank',
+        transactions: [
+          {
+            accountId: 'acc_001',
+            categoryId: 'cat_003',
+            date: '2026-08-21',
+            amount: 15,
+            description: 'Cafe',
+            type: 'expense',
+            externalId: 'ext_txn_001',
+          },
+        ],
+      })
+      .expect(401);
+
+    delete process.env.BANK_INGEST_API_KEY;
+  });
+
+  it('/api/transactions/import skips duplicated externalId (POST)', async () => {
+    process.env.BANK_INGEST_API_KEY = 'test-ingest-key';
+
+    const payload = {
+      source: 'bank',
+      transactions: [
+        {
+          accountId: 'acc_001',
+          categoryId: 'cat_003',
+          date: '2026-08-21',
+          amount: 15,
+          description: 'Cafe',
+          type: 'expense',
+          externalId: 'ext_txn_001',
+        },
+      ],
+    };
+
+    await request(app.getHttpServer())
+      .post('/api/transactions/import')
+      .set('x-api-key', 'test-ingest-key')
+      .send(payload)
+      .expect(201)
+      .expect((res) => {
+        expect(res.body).toMatchObject({
+          imported: 1,
+          skipped: 0,
+          source: 'bank',
+        });
+      });
+
+    await request(app.getHttpServer())
+      .post('/api/transactions/import')
+      .set('x-api-key', 'test-ingest-key')
+      .send(payload)
+      .expect(201)
+      .expect((res) => {
+        expect(res.body).toMatchObject({
+          imported: 0,
+          skipped: 1,
+          source: 'bank',
+        });
+      });
+
+    delete process.env.BANK_INGEST_API_KEY;
+  });
+
   it('/api/sync-history (GET)', () => {
     return request(app.getHttpServer())
       .get('/api/sync-history')

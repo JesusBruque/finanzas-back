@@ -1,0 +1,325 @@
+{
+  "name": "Finanzas - Sync with Enable Banking Gate",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "finanzas-sync",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "a7a1c886-1638-4a8b-a5bc-b0a87c2c1231",
+      "name": "Webhook Trigger",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        220,
+        300
+      ],
+      "webhookId": "finanzas-sync"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "8e6af9f6-04f0-4ddf-98ed-c35f1c7a2f12",
+              "leftValue": "={{$json.headers[\"x-api-key\"]}}",
+              "rightValue": "finanzas-n8n-trigger-local",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "fd5003ff-4886-43d6-aa34-4e32299c11c2",
+      "name": "IF Trigger Token Valid",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        460,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "command": "cd c:\\Users\\bruke\\OneDrive\\Desktop\\Programación\\vibeCoding\\finanzas-back; npm run enablebanking:banks:json"
+      },
+      "id": "5e4a5888-8f89-4bcb-883e-71f6832e63a8",
+      "name": "Check Target Banks",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        700,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const raw = $json.stdout || $json.data || '';\nlet parsed;\ntry {\n  parsed = JSON.parse(raw);\n} catch (err) {\n  return [{ json: { parseError: true, raw, allTargetsFound: false } }];\n}\nreturn [{ json: parsed }];"
+      },
+      "id": "f8ed2d31-13ef-4a17-af67-83e9d3efacf9",
+      "name": "Parse Bank Check JSON",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        940,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "5d0dbd72-1981-4ec5-bc9f-f4f94f36fe50",
+              "leftValue": "={{$json.allTargetsFound}}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "467bf21a-5ff1-4061-b7ff-6d5d2c558530",
+      "name": "IF Target Banks Available",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1180,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "13ab8cc8-336e-413d-9d14-ef49095a14f0",
+              "name": "source",
+              "value": "bank",
+              "type": "string"
+            },
+            {
+              "id": "a356d6f7-ad8f-4cb8-a34c-4f55bd30ef04",
+              "name": "transactions",
+              "value": "=[{\n  \"accountId\": \"acc_001\",\n  \"categoryId\": \"cat_003\",\n  \"date\": \"2026-08-23\",\n  \"amount\": 24.9,\n  \"description\": \"Internet mensual\",\n  \"type\": \"expense\",\n  \"source\": \"bank\",\n  \"externalId\": \"demo-bank-2026-08-23-001\"\n},{\n  \"accountId\": \"acc_001\",\n  \"categoryId\": \"cat_001\",\n  \"date\": \"2026-08-23\",\n  \"amount\": 11.5,\n  \"description\": \"Compra rapida\",\n  \"type\": \"expense\",\n  \"source\": \"bank\",\n  \"externalId\": \"demo-bank-2026-08-23-002\"\n}]",
+              "type": "array"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "8f14207f-8600-47b2-bf90-1550af7df338",
+      "name": "Build Import Payload",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        1420,
+        120
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://localhost:3000/api/transactions/import",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "x-api-key",
+              "value": "finanzas-bank-ingest-local"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{$json}}",
+        "options": {}
+      },
+      "id": "44911e0d-6c7e-4bc0-8aa4-5db2ca72a643",
+      "name": "Import Into Backend",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1660,
+        120
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{$json}}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "6cd14dab-0fcb-4d6b-b1f8-fcd69f0e056f",
+      "name": "Respond Success",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1900,
+        120
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={\"error\":\"target banks not available for this Enable Banking account\",\"details\":$json}",
+        "options": {
+          "responseCode": 412
+        }
+      },
+      "id": "7ca1bea6-3851-4a9a-98cf-6289f830db42",
+      "name": "Respond Banks Missing",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1420,
+        320
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={\"error\":\"invalid n8n trigger token\"}",
+        "options": {
+          "responseCode": 401
+        }
+      },
+      "id": "7ac770a9-07ec-4fd7-a8ca-eacf0c55f95d",
+      "name": "Respond Unauthorized",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        700,
+        420
+      ]
+    }
+  ],
+  "connections": {
+    "Webhook Trigger": {
+      "main": [
+        [
+          {
+            "node": "IF Trigger Token Valid",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF Trigger Token Valid": {
+      "main": [
+        [
+          {
+            "node": "Check Target Banks",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond Unauthorized",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Target Banks": {
+      "main": [
+        [
+          {
+            "node": "Parse Bank Check JSON",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Bank Check JSON": {
+      "main": [
+        [
+          {
+            "node": "IF Target Banks Available",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF Target Banks Available": {
+      "main": [
+        [
+          {
+            "node": "Build Import Payload",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond Banks Missing",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Import Payload": {
+      "main": [
+        [
+          {
+            "node": "Import Into Backend",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Import Into Backend": {
+      "main": [
+        [
+          {
+            "node": "Respond Success",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {},
+  "active": false,
+  "versionId": "b70c3c5c-f1f5-47f4-b01a-0df2a7f4ea3f",
+  "meta": {
+    "instanceId": "finanzas-local"
+  },
+  "id": "finanzas-enablebanking-gate"
+}
