@@ -424,6 +424,11 @@ export class FinanceService {
       }
 
       for (const item of list) {
+        if (typeof item === 'string' && item.length > 0) {
+          ids.push(item);
+          continue;
+        }
+
         if (!item || typeof item !== 'object') {
           continue;
         }
@@ -450,6 +455,8 @@ export class FinanceService {
   }
 
   private async fetchEnableBankingAccountTransactions(accountId: string, jwt: string): Promise<Record<string, unknown> | null> {
+    const state = await this.getEnableBankingState();
+    const sessionId = typeof state.latestSessionId === 'string' ? state.latestSessionId : null;
     const today = new Date();
     const dateFrom = new Date(today);
     dateFrom.setFullYear(today.getFullYear() - 1);
@@ -461,6 +468,13 @@ export class FinanceService {
       `https://api.enablebanking.com/accounts/${accountId}/transactions?booking_status=booked`,
       `https://api.enablebanking.com/accounts/${accountId}/transactions?date_from=${dateFromIso}&date_to=${dateToIso}`,
       `https://api.enablebanking.com/accounts/${accountId}/transactions?booking_status=booked&date_from=${dateFromIso}&date_to=${dateToIso}`,
+      ...(sessionId
+        ? [
+            `https://api.enablebanking.com/sessions/${sessionId}/accounts/${accountId}/transactions`,
+            `https://api.enablebanking.com/sessions/${sessionId}/accounts/${accountId}/transactions?booking_status=booked`,
+            `https://api.enablebanking.com/sessions/${sessionId}/accounts/${accountId}/transactions?date_from=${dateFromIso}&date_to=${dateToIso}`,
+          ]
+        : []),
     ];
 
     for (const url of candidates) {
