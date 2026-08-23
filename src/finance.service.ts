@@ -349,6 +349,7 @@ export class FinanceService {
     const candidates = [
       `https://api.enablebanking.com/sessions/${sessionId}/accounts`,
       `https://api.enablebanking.com/accounts?session_id=${encodeURIComponent(sessionId)}`,
+      `https://api.enablebanking.com/accounts?session=${encodeURIComponent(sessionId)}`,
       `https://api.enablebanking.com/sessions/${sessionId}`,
     ];
 
@@ -399,7 +400,15 @@ export class FinanceService {
         }
 
         const account = item as Record<string, unknown>;
-        const candidate = [account.id, account.accountId, account.account_id]
+        const candidate = [
+          account.id,
+          account.accountId,
+          account.account_id,
+          account.uid,
+          account.uuid,
+          account.resourceId,
+          account.resource_id,
+        ]
           .find((value): value is string => typeof value === 'string' && value.length > 0);
 
         if (candidate) {
@@ -412,9 +421,17 @@ export class FinanceService {
   }
 
   private async fetchEnableBankingAccountTransactions(accountId: string, jwt: string): Promise<Record<string, unknown> | null> {
+    const today = new Date();
+    const dateFrom = new Date(today);
+    dateFrom.setFullYear(today.getFullYear() - 1);
+    const dateFromIso = dateFrom.toISOString().slice(0, 10);
+    const dateToIso = today.toISOString().slice(0, 10);
+
     const candidates = [
       `https://api.enablebanking.com/accounts/${accountId}/transactions`,
       `https://api.enablebanking.com/accounts/${accountId}/transactions?booking_status=booked`,
+      `https://api.enablebanking.com/accounts/${accountId}/transactions?date_from=${dateFromIso}&date_to=${dateToIso}`,
+      `https://api.enablebanking.com/accounts/${accountId}/transactions?booking_status=booked&date_from=${dateFromIso}&date_to=${dateToIso}`,
     ];
 
     for (const url of candidates) {
@@ -450,9 +467,13 @@ export class FinanceService {
       payload.booked,
       payload.pending,
       payload.data,
+      payload.items,
+      payload.results,
       payload.transactions,
       transactionsNode?.booked,
       transactionsNode?.pending,
+      transactionsNode?.items,
+      transactionsNode?.results,
       transactionsNode?.transactions,
     ];
 
@@ -479,7 +500,7 @@ export class FinanceService {
     const amountInfo = (entry.transactionAmount as Record<string, unknown> | undefined)
       ?? (entry.amount as Record<string, unknown> | undefined);
     const rawAmount = amountInfo?.amount ?? entry.amount;
-    const numericAmount = Number(rawAmount);
+    const numericAmount = Number(String(rawAmount).replace(',', '.'));
     if (!Number.isFinite(numericAmount) || numericAmount === 0) {
       return null;
     }
@@ -512,6 +533,8 @@ export class FinanceService {
       entry.internalTransactionId,
       entry.id,
       entry.entryReference,
+      entry.reference,
+      entry.uid,
     ].find((value): value is string => typeof value === 'string' && value.length > 0);
 
     const externalId = externalIdCandidate
