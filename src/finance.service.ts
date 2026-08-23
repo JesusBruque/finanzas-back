@@ -868,6 +868,7 @@ export class FinanceService {
     }
 
     const jwt = this.createEnableBankingJwt(appId, privateKeyPem);
+    const probes = await this.probeEnableBankingSessionEndpoints(sessionId, jwt);
     const accountIds = await this.fetchEnableBankingAccountIds(sessionId, jwt);
     const perAccount: Array<{ accountId: string; transactionCount: number; sample: Record<string, unknown> | null }> = [];
     let totalTransactions = 0;
@@ -889,7 +890,63 @@ export class FinanceService {
       accountCount: accountIds.length,
       totalTransactions,
       perAccount,
+      probes,
     };
+  }
+
+  private async probeEnableBankingSessionEndpoints(sessionId: string, jwt: string): Promise<Array<{
+    url: string;
+    status: number;
+    hasJson: boolean;
+    keys: string[];
+    preview: string;
+  }>> {
+    const urls = [
+      `https://api.enablebanking.com/sessions/${sessionId}`,
+      `https://api.enablebanking.com/sessions/${sessionId}/accounts`,
+      `https://api.enablebanking.com/accounts?session_id=${encodeURIComponent(sessionId)}`,
+      `https://api.enablebanking.com/accounts?session=${encodeURIComponent(sessionId)}`,
+    ];
+
+    const results: Array<{
+      url: string;
+      status: number;
+      hasJson: boolean;
+      keys: string[];
+      preview: string;
+    }> = [];
+
+    for (const url of urls) {
+      try {
+        const response = await fetch(url, {
+          method: 'GET',
+          headers: {
+            Authorization: `Bearer ${jwt}`,
+            Accept: 'application/json',
+          },
+        });
+
+        const bodyText = await response.text();
+        const parsed = this.safeParseJson(bodyText);
+        results.push({
+          url,
+          status: response.status,
+          hasJson: Boolean(parsed),
+          keys: parsed ? Object.keys(parsed) : [],
+          preview: bodyText.slice(0, 400),
+        });
+      } catch (error) {
+        results.push({
+          url,
+          status: 0,
+          hasJson: false,
+          keys: [],
+          preview: error instanceof Error ? error.message : 'request failed',
+        });
+      }
+    }
+
+    return results;
   }
 
   async getDashboard(month?: string, categoryId?: string) {
