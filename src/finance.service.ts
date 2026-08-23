@@ -282,16 +282,40 @@ export class FinanceService {
 
   private async syncTransactionsFromEnableBanking(syncId: string, sessionId: string): Promise<void> {
     try {
-      const imported = await this.pullEnableBankingTransactions(sessionId);
+      const result = await this.pullEnableBankingTransactions(sessionId);
+      await this.updateEnableBankingState({
+        lastSyncResult: {
+          syncId,
+          at: new Date().toISOString(),
+          status: result.imported > 0 ? 'success' : 'error',
+          accountCount: result.accountCount,
+          fetchedCount: result.fetchedCount,
+          imported: result.imported,
+          skipped: result.skipped,
+        },
+      });
+
+      if (result.imported === 0) {
+        await this.syncHistoryModel.updateOne(
+          { id: syncId },
+          { $set: { status: 'error' } },
+        );
+        return;
+      }
+
       await this.syncHistoryModel.updateOne(
         { id: syncId },
         { $set: { status: 'success' } },
       );
-
-      if (imported > 0) {
-        return;
-      }
-    } catch {
+    } catch (error) {
+      await this.updateEnableBankingState({
+        lastSyncResult: {
+          syncId,
+          at: new Date().toISOString(),
+          status: 'error',
+          error: error instanceof Error ? error.message : 'Unknown sync error',
+        },
+      });
       await this.syncHistoryModel.updateOne(
         { id: syncId },
         { $set: { status: 'error' } },
@@ -299,7 +323,7 @@ export class FinanceService {
     }
   }
 
-  private async pullEnableBankingTransactions(sessionId: string): Promise<number> {
+  private async pullEnableBankingTransactions(sessionId: string): Promise<{ imported: number; skipped: number; accountCount: number; fetchedCount: number }> {
     const appId = process.env.ENABLE_BANKING_APP_ID;
     const privateKeyPem = this.getEnableBankingPrivateKeyPem();
     if (!appId || !privateKeyPem) {
@@ -309,7 +333,7 @@ export class FinanceService {
     const jwt = this.createEnableBankingJwt(appId, privateKeyPem);
     const accountIds = await this.fetchEnableBankingAccountIds(sessionId, jwt);
     if (accountIds.length === 0) {
-      return 0;
+      throw new Error('No bank accounts found for authorized session');
     }
 
     const accounts = await this.getAccounts();
@@ -334,7 +358,7 @@ export class FinanceService {
     }
 
     if (transactions.length === 0) {
-      return 0;
+      throw new Error('No transactions returned by provider for connected accounts');
     }
 
     const imported = await this.importTransactions({
@@ -342,7 +366,12 @@ export class FinanceService {
       transactions,
     });
 
-    return imported.imported;
+    return {
+      imported: imported.imported,
+      skipped: imported.skipped ?? 0,
+      accountCount: accountIds.length,
+      fetchedCount: transactions.length,
+    };
   }
 
   private async fetchEnableBankingAccountIds(sessionId: string, jwt: string): Promise<string[]> {
@@ -814,6 +843,7 @@ export class FinanceService {
         typeof state.lastExchangeError === 'string' ? state.lastExchangeError : null,
       lastCallbackAt: typeof state.lastCallbackAt === 'string' ? state.lastCallbackAt : null,
       lastCallback: (state.lastCallback as Record<string, unknown> | undefined) ?? null,
+      lastSyncResult: (state.lastSyncResult as Record<string, unknown> | undefined) ?? null,
     };
   }
 
