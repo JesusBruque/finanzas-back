@@ -541,6 +541,7 @@ export class FinanceService {
     context: { fallbackAccountId: string; sourceAccountId: string; sessionId: string },
   ): CreateTransactionDto | null {
     const amountInfo = (entry.transactionAmount as Record<string, unknown> | undefined)
+      ?? (entry.transaction_amount as Record<string, unknown> | undefined)
       ?? (entry.amount as Record<string, unknown> | undefined);
     const rawAmount = amountInfo?.amount ?? entry.amount;
     const numericAmount = Number(String(rawAmount).replace(',', '.'));
@@ -548,7 +549,7 @@ export class FinanceService {
       return null;
     }
 
-    const indicator = String(entry.creditDebitIndicator ?? '').toUpperCase();
+    const indicator = String(entry.creditDebitIndicator ?? entry.credit_debit_indicator ?? '').toUpperCase();
     const isIncome = indicator === 'CRDT' || numericAmount > 0;
     const type: 'income' | 'expense' = isIncome ? 'income' : 'expense';
     const amount = Math.abs(numericAmount);
@@ -559,13 +560,22 @@ export class FinanceService {
       entry.date,
       entry.booking_date,
       entry.value_date,
+      entry.transaction_date,
     ].find((value): value is string => typeof value === 'string' && value.length >= 10);
     const date = (dateCandidate ?? new Date().toISOString()).slice(0, 10);
+
+    const remittance = Array.isArray(entry.remittance_information)
+      ? (entry.remittance_information.find((value): value is string => typeof value === 'string' && value.trim().length > 0) ?? null)
+      : null;
 
     const descriptionCandidate = [
       entry.remittanceInformationUnstructured,
       entry.remittanceInformationStructured,
       entry.additionalInformation,
+      remittance,
+      entry.reference_number,
+      (entry.creditor as Record<string, unknown> | undefined)?.name,
+      (entry.debtor as Record<string, unknown> | undefined)?.name,
       entry.creditorName,
       entry.debtorName,
       entry.description,
@@ -576,6 +586,9 @@ export class FinanceService {
       entry.internalTransactionId,
       entry.id,
       entry.entryReference,
+      entry.entry_reference,
+      entry.reference_number,
+      entry.transaction_id,
       entry.reference,
       entry.uid,
     ].find((value): value is string => typeof value === 'string' && value.length > 0);
