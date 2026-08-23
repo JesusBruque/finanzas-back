@@ -388,12 +388,13 @@ export class FinanceService {
   async getEnableBankingConnectUrl() {
     const appId = process.env.ENABLE_BANKING_APP_ID;
     const redirectUrl = this.getEnableBankingRedirectUrl();
+    const privateKeyPem = this.getEnableBankingPrivateKeyPem();
     const country = process.env.ENABLE_BANKING_COUNTRY || 'ES';
 
-    if (!appId || !redirectUrl) {
+    if (!appId || !redirectUrl || !privateKeyPem) {
       return {
         configured: false,
-        error: 'Missing ENABLE_BANKING_APP_ID or ENABLE_BANKING_REDIRECT_URL',
+        error: 'Missing ENABLE_BANKING_APP_ID, ENABLE_BANKING_PRIVATE_KEY_PEM/PATH or ENABLE_BANKING_REDIRECT_URL',
       };
     }
 
@@ -412,9 +413,40 @@ export class FinanceService {
       country,
     });
 
+    const jwt = this.createEnableBankingJwt(appId, privateKeyPem);
+    const upstreamUrl = `https://api.enablebanking.com/auth?${params.toString()}`;
+    const upstreamResponse = await fetch(upstreamUrl, {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${jwt}`,
+        Accept: 'application/json',
+      },
+      redirect: 'manual',
+    });
+
+    const locationHeader = upstreamResponse.headers.get('location');
+    const bodyText = await upstreamResponse.text();
+    const parsedBody = this.safeParseJson(bodyText);
+
+    const authUrlFromBody = parsedBody
+      ? [parsedBody.authUrl, parsedBody.auth_url, parsedBody.authorizationUrl, parsedBody.url]
+          .find((value): value is string => typeof value === 'string' && value.startsWith('http'))
+      : null;
+
+    const resolvedAuthUrl = locationHeader ?? authUrlFromBody;
+
+    if (!resolvedAuthUrl) {
+      const errorDetail = parsedBody ? JSON.stringify(parsedBody) : bodyText;
+      return {
+        configured: false,
+        error: `Enable Banking connect URL request failed (${upstreamResponse.status})`,
+        response: errorDetail,
+      };
+    }
+
     return {
       configured: true,
-      authUrl: `https://api.enablebanking.com/auth?${params.toString()}`,
+      authUrl: resolvedAuthUrl,
       state,
       redirectUrl,
       country,
