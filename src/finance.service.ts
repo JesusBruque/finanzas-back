@@ -390,6 +390,10 @@ export class FinanceService {
     const redirectUrl = this.getEnableBankingRedirectUrl();
     const privateKeyPem = this.getEnableBankingPrivateKeyPem();
     const country = process.env.ENABLE_BANKING_COUNTRY || 'ES';
+    const targetBank = (process.env.ENABLE_BANKING_TARGET_BANKS || 'Bankinter')
+      .split(',')
+      .map((item) => item.trim())
+      .filter(Boolean)[0] || 'Bankinter';
 
     if (!appId || !redirectUrl || !privateKeyPem) {
       return {
@@ -405,35 +409,38 @@ export class FinanceService {
       lastExchangeError: null,
     });
 
-    const params = new URLSearchParams({
-      response_type: 'code',
-      client_id: appId,
-      redirect_uri: redirectUrl,
-      state,
-      country,
-    });
-
     const jwt = this.createEnableBankingJwt(appId, privateKeyPem);
-    const upstreamUrl = `https://api.enablebanking.com/auth?${params.toString()}`;
-    const upstreamResponse = await fetch(upstreamUrl, {
-      method: 'GET',
+    const validUntil = new Date(Date.now() + 1000 * 60 * 60 * 24 * 90).toISOString();
+    const upstreamResponse = await fetch('https://api.enablebanking.com/auth', {
+      method: 'POST',
       headers: {
         Authorization: `Bearer ${jwt}`,
+        'Content-Type': 'application/json',
         Accept: 'application/json',
       },
-      redirect: 'manual',
+      body: JSON.stringify({
+        access: {
+          balances: true,
+          transactions: true,
+          valid_until: validUntil,
+        },
+        aspsp: {
+          country,
+          name: targetBank,
+        },
+        psu_type: 'personal',
+        redirect_url: redirectUrl,
+        state,
+      }),
     });
 
-    const locationHeader = upstreamResponse.headers.get('location');
     const bodyText = await upstreamResponse.text();
     const parsedBody = this.safeParseJson(bodyText);
 
-    const authUrlFromBody = parsedBody
-      ? [parsedBody.authUrl, parsedBody.auth_url, parsedBody.authorizationUrl, parsedBody.url]
+    const resolvedAuthUrl = parsedBody
+      ? [parsedBody.url, parsedBody.authUrl, parsedBody.auth_url, parsedBody.authorizationUrl]
           .find((value): value is string => typeof value === 'string' && value.startsWith('http'))
       : null;
-
-    const resolvedAuthUrl = locationHeader ?? authUrlFromBody;
 
     if (!resolvedAuthUrl) {
       const errorDetail = parsedBody ? JSON.stringify(parsedBody) : bodyText;
@@ -450,8 +457,7 @@ export class FinanceService {
       state,
       redirectUrl,
       country,
-      upstreamStatus: upstreamResponse.status,
-      authUrlSource: locationHeader ? 'location' : 'body',
+      bank: targetBank,
     };
   }
 
