@@ -143,4 +143,9 @@ export class Block1Controller {
   getEnableBankingSessionStatus() {
     return this.financeService.getEnableBankingSessionStatus();
   }
+
+  @Get('enablebanking/debug-pull')
+  debugEnableBankingPull() {
+    return this.financeService.debugEnableBankingPull();
+  }
 }

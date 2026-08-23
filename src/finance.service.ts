@@ -847,6 +847,51 @@ export class FinanceService {
     };
   }
 
+  async debugEnableBankingPull() {
+    const state = await this.getEnableBankingState();
+    const sessionId = typeof state.latestSessionId === 'string' ? state.latestSessionId : null;
+
+    if (!sessionId) {
+      return {
+        ok: false,
+        error: 'No active session id',
+      };
+    }
+
+    const appId = process.env.ENABLE_BANKING_APP_ID;
+    const privateKeyPem = this.getEnableBankingPrivateKeyPem();
+    if (!appId || !privateKeyPem) {
+      return {
+        ok: false,
+        error: 'Missing Enable Banking credentials',
+      };
+    }
+
+    const jwt = this.createEnableBankingJwt(appId, privateKeyPem);
+    const accountIds = await this.fetchEnableBankingAccountIds(sessionId, jwt);
+    const perAccount: Array<{ accountId: string; transactionCount: number; sample: Record<string, unknown> | null }> = [];
+    let totalTransactions = 0;
+
+    for (const accountId of accountIds) {
+      const payload = await this.fetchEnableBankingAccountTransactions(accountId, jwt);
+      const entries = this.extractEnableBankingTransactionEntries(payload);
+      totalTransactions += entries.length;
+      perAccount.push({
+        accountId,
+        transactionCount: entries.length,
+        sample: entries[0] ?? null,
+      });
+    }
+
+    return {
+      ok: true,
+      sessionId,
+      accountCount: accountIds.length,
+      totalTransactions,
+      perAccount,
+    };
+  }
+
   async getDashboard(month?: string, categoryId?: string) {
     const monthFilter = month || new Date().toISOString().slice(0, 7);
     const transactions = await this.getTransactions();
