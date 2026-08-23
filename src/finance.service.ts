@@ -387,7 +387,7 @@ export class FinanceService {
 
   async getEnableBankingConnectUrl() {
     const appId = process.env.ENABLE_BANKING_APP_ID;
-    const redirectUrl = process.env.ENABLE_BANKING_REDIRECT_URL;
+    const redirectUrl = this.getEnableBankingRedirectUrl();
     const country = process.env.ENABLE_BANKING_COUNTRY || 'ES';
 
     if (!appId || !redirectUrl) {
@@ -638,7 +638,7 @@ export class FinanceService {
     raw: Record<string, unknown> | string;
   }> {
     const appId = process.env.ENABLE_BANKING_APP_ID;
-    const redirectUrl = process.env.ENABLE_BANKING_REDIRECT_URL;
+    const redirectUrl = this.getEnableBankingRedirectUrl();
     const privateKeyPem = this.getEnableBankingPrivateKeyPem();
 
     if (!appId || !redirectUrl || !privateKeyPem) {
@@ -713,6 +713,16 @@ export class FinanceService {
     }
 
     return null;
+  }
+
+  private getEnableBankingRedirectUrl(): string | null {
+    const fromEnv = process.env.ENABLE_BANKING_REDIRECT_URL?.trim();
+    if (fromEnv) {
+      return fromEnv;
+    }
+
+    // Safe production fallback when Render env is temporarily missing.
+    return 'https://finanzas-back-yzbs.onrender.com/api/enablebanking/callback';
   }
 
   private async getEnableBankingState(): Promise<Record<string, unknown>> {
