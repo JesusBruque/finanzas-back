@@ -1,0 +1,74 @@
+{
+  "name": "Finanzas - Daily Bank Sync",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 7 * * *"
+            }
+          ]
+        }
+      },
+      "id": "f2a8b6e1-3c4d-4a2e-9b1f-6d8c7a5e2f10",
+      "name": "Every day at 07:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        260,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://finanzas-back-yzbs.onrender.com/api/bank-sync/scheduled",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "x-api-key",
+              "value": "finanzas-bank-ingest-prod"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "a1d9c3f7-5e6b-4c8a-9f2d-1b3e4c5d6a70",
+      "name": "Trigger Backend Sync",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        500,
+        300
+      ]
+    }
+  ],
+  "connections": {
+    "Every day at 07:00": {
+      "main": [
+        [
+          {
+            "node": "Trigger Backend Sync",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {},
+  "active": false,
+  "versionId": "d4e5f6a7-8b9c-4d0e-af12-3b4c5d6e7f80",
+  "meta": {
+    "instanceId": "finanzas-daily-sync"
+  },
+  "id": "finanzas-daily-sync"
+}

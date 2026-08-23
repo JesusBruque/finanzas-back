@@ -4,7 +4,6 @@ import { Model } from 'mongoose';
 import fs from 'node:fs';
 import crypto from 'node:crypto';
 import {
-  BankSyncDto,
   CreateAccountDto,
   CreateExpenseDto,
   CreateTransactionDto,
@@ -181,174 +180,110 @@ export class FinanceService {
     return transaction.toObject();
   }
 
-  async triggerBankSync(dto?: BankSyncDto) {
-    const provider = dto?.provider ?? 'open-banking';
-    const syncAt = new Date().toISOString();
-    const enableBankingState = await this.getEnableBankingState();
-    const latestSessionId =
-      typeof enableBankingState.latestSessionId === 'string'
-        ? enableBankingState.latestSessionId
-        : null;
-    const record = await this.syncHistoryModel.create({
-      id: `sync_${Date.now()}`,
-      provider,
-      status: 'queued',
-      syncAt,
-    });
-    const { _id, ...createdRecord } = record.toObject();
-
-    if (!latestSessionId) {
-      await this.syncHistoryModel.updateOne(
-        { id: createdRecord.id },
-        { $set: { status: 'error' } },
-      );
-
-      return {
-        id: createdRecord.id,
-        provider,
-        status: 'error',
-        syncAt: createdRecord.syncAt,
-        message: 'No hay sesion bancaria activa. Conecta el banco primero.',
-      };
-    }
-
-    await this.syncHistoryModel.updateOne(
-      { id: createdRecord.id },
-      { $set: { status: 'running' } },
+  async triggerBankSync() {
+    const connections = await this.ensureEnableBankingConnections();
+    const connected = connections.filter(
+      (connection) => connection.status === 'connected' && typeof connection.sessionId === 'string' && connection.sessionId,
     );
+    const syncAt = new Date().toISOString();
 
-    void this.syncTransactionsFromEnableBanking(createdRecord.id, latestSessionId);
-
-    const n8nWebhookUrl = process.env.N8N_SYNC_WEBHOOK_URL;
-    if (!n8nWebhookUrl) {
+    if (connected.length === 0) {
       return {
-        id: createdRecord.id,
-        provider,
-        status: 'running',
-        syncAt: createdRecord.syncAt,
-        message: 'Sincronización iniciada',
+        status: 'error' as const,
+        syncAt,
+        message: 'No hay ningún banco conectado todavía. Conecta al menos uno primero.',
+        banks: [] as string[],
       };
     }
 
-    try {
-      const headers: Record<string, string> = {
-        'content-type': 'application/json',
-      };
-      const n8nToken = process.env.N8N_SYNC_WEBHOOK_TOKEN;
-      if (n8nToken) {
-        headers['x-api-key'] = n8nToken;
-      }
-
-      const response = await fetch(n8nWebhookUrl, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify({
-          syncId: createdRecord.id,
-          provider,
-          requestedAt: syncAt,
-          enableBanking: {
-            sessionId: latestSessionId,
-          },
-        }),
+    for (const connection of connected) {
+      const bankKey = String(connection.bankKey);
+      const record = await this.syncHistoryModel.create({
+        id: `sync_${Date.now()}_${bankKey}`,
+        provider: String(connection.bankName),
+        status: 'running',
+        syncAt,
       });
 
-      if (!response.ok) {
-        return {
-          id: createdRecord.id,
-          provider,
-          status: 'running',
-          syncAt: createdRecord.syncAt,
-          message: `Sincronización iniciada (n8n devolvio ${response.status})`,
-        };
-      }
-
-      return {
-        id: createdRecord.id,
-        provider,
-        status: 'running',
-        syncAt: createdRecord.syncAt,
-        message: 'Sincronización enviada a n8n',
-      };
-    } catch {
-      return {
-        id: createdRecord.id,
-        provider,
-        status: 'running',
-        syncAt: createdRecord.syncAt,
-        message: 'Sincronización iniciada (n8n no disponible)',
-      };
+      void this.runBankSync(bankKey, record.id);
     }
+
+    return {
+      status: 'running' as const,
+      syncAt,
+      message: `Sincronización iniciada para ${connected.length} banco(s)`,
+      banks: connected.map((connection) => String(connection.bankName)),
+    };
   }
 
-  private async syncTransactionsFromEnableBanking(syncId: string, sessionId: string): Promise<void> {
+  async triggerScheduledBankSync(apiKey?: string) {
+    const ingestApiKey = process.env.BANK_INGEST_API_KEY;
+    if (ingestApiKey && apiKey !== ingestApiKey) {
+      throw new UnauthorizedException('Invalid sync API key');
+    }
+
+    return this.triggerBankSync();
+  }
+
+  private async runBankSync(bankKey: string, syncHistoryId: string): Promise<void> {
     try {
-      const result = await this.pullEnableBankingTransactions(sessionId);
-      await this.updateEnableBankingState({
-        lastSyncResult: {
-          syncId,
-          at: new Date().toISOString(),
-          status: result.imported > 0 ? 'success' : 'error',
-          accountCount: result.accountCount,
-          fetchedCount: result.fetchedCount,
-          imported: result.imported,
-          skipped: result.skipped,
-        },
+      const result = await this.pullEnableBankingTransactionsForBank(bankKey);
+      await this.updateEnableBankingConnection(bankKey, {
+        lastSyncAt: new Date().toISOString(),
+        lastSyncStatus: 'success',
+        lastSyncImported: result.imported,
+        lastSyncSkipped: result.skipped,
+        lastSyncError: null,
+        accountCount: result.accountCount,
       });
 
-      if (result.imported === 0) {
-        await this.syncHistoryModel.updateOne(
-          { id: syncId },
-          { $set: { status: 'error' } },
-        );
-        return;
-      }
-
-      await this.syncHistoryModel.updateOne(
-        { id: syncId },
-        { $set: { status: 'success' } },
-      );
+      await this.syncHistoryModel.updateOne({ id: syncHistoryId }, { $set: { status: 'success' } });
     } catch (error) {
-      await this.updateEnableBankingState({
-        lastSyncResult: {
-          syncId,
-          at: new Date().toISOString(),
-          status: 'error',
-          error: error instanceof Error ? error.message : 'Unknown sync error',
-        },
+      const message = error instanceof Error ? error.message : 'Unknown sync error';
+      await this.updateEnableBankingConnection(bankKey, {
+        lastSyncAt: new Date().toISOString(),
+        lastSyncStatus: 'error',
+        lastSyncError: message,
       });
-      await this.syncHistoryModel.updateOne(
-        { id: syncId },
-        { $set: { status: 'error' } },
-      );
+
+      await this.syncHistoryModel.updateOne({ id: syncHistoryId }, { $set: { status: 'error' } });
     }
   }
 
-  private async pullEnableBankingTransactions(sessionId: string): Promise<{ imported: number; skipped: number; accountCount: number; fetchedCount: number }> {
+  private async pullEnableBankingTransactionsForBank(bankKey: string): Promise<{ imported: number; skipped: number; accountCount: number; fetchedCount: number }> {
     const appId = process.env.ENABLE_BANKING_APP_ID;
     const privateKeyPem = this.getEnableBankingPrivateKeyPem();
     if (!appId || !privateKeyPem) {
       throw new Error('Enable Banking credentials missing for sync');
     }
 
-    const jwt = this.createEnableBankingJwt(appId, privateKeyPem);
-    const accountIds = await this.fetchEnableBankingAccountIds(sessionId, jwt);
-    if (accountIds.length === 0) {
-      throw new Error('No bank accounts found for authorized session');
+    const connections = await this.ensureEnableBankingConnections();
+    const connection = connections.find((item) => item.bankKey === bankKey);
+    const sessionId = connection && typeof connection.sessionId === 'string' ? connection.sessionId : null;
+    if (!connection || !sessionId) {
+      throw new Error('No hay sesión activa para este banco');
     }
 
-    const accounts = await this.getAccounts();
-    const defaultAccountId = accounts[0]?.id ?? 'acc_001';
+    const bankName = String(connection.bankName);
+    const jwt = this.createEnableBankingJwt(appId, privateKeyPem);
+    const accountUids = await this.fetchEnableBankingAccountIds(sessionId, jwt);
+    if (accountUids.length === 0) {
+      throw new Error('No se encontraron cuentas para la sesión autorizada');
+    }
+
     const transactions: CreateTransactionDto[] = [];
 
-    for (const accountId of accountIds) {
-      const payload = await this.fetchEnableBankingAccountTransactions(accountId, jwt);
+    for (let index = 0; index < accountUids.length; index += 1) {
+      const accountUid = accountUids[index];
+      const localAccount = await this.getOrCreateBankAccount(bankKey, bankName, accountUid, index);
+      const payload = await this.fetchEnableBankingAccountTransactions(accountUid, jwt);
       const rawEntries = this.extractEnableBankingTransactionEntries(payload);
 
       for (const rawEntry of rawEntries) {
         const mapped = this.mapEnableBankingEntryToTransaction(rawEntry, {
-          fallbackAccountId: defaultAccountId,
-          sourceAccountId: accountId,
-          sessionId,
+          fallbackAccountId: localAccount.id,
+          sourceAccountId: accountUid,
+          bankKey,
         });
 
         if (mapped) {
@@ -358,7 +293,8 @@ export class FinanceService {
     }
 
     if (transactions.length === 0) {
-      throw new Error('No transactions returned by provider for connected accounts');
+      // No new movements is a normal, successful outcome — not every sync finds fresh transactions.
+      return { imported: 0, skipped: 0, accountCount: accountUids.length, fetchedCount: 0 };
     }
 
     const imported = await this.importTransactions({
@@ -369,9 +305,37 @@ export class FinanceService {
     return {
       imported: imported.imported,
       skipped: imported.skipped ?? 0,
-      accountCount: accountIds.length,
+      accountCount: accountUids.length,
       fetchedCount: transactions.length,
     };
+  }
+
+  private async getOrCreateBankAccount(
+    bankKey: string,
+    bankName: string,
+    externalAccountId: string,
+    indexWithinBank: number,
+  ): Promise<{ id: string }> {
+    const existing = await this.accountModel.findOne({ bankKey, externalAccountId }).lean();
+    if (existing) {
+      return { id: String(existing.id) };
+    }
+
+    const account = await this.accountModel.create({
+      id: `acc_${bankKey}_${externalAccountId.slice(0, 8)}`,
+      // Enable Banking hashes IBAN/name for privacy, so accounts are labelled by
+      // bank + a stable position instead of a real account name.
+      name: `${bankName} · Cuenta ${indexWithinBank + 1}`,
+      type: 'checking',
+      balance: 0,
+      currency: 'EUR',
+      bankKey,
+      bankName,
+      externalAccountId,
+      createdAt: new Date().toISOString(),
+    });
+
+    return { id: account.id };
   }
 
   private async fetchEnableBankingAccountIds(sessionId: string, jwt: string): Promise<string[]> {
@@ -455,45 +419,32 @@ export class FinanceService {
   }
 
   private async fetchEnableBankingAccountTransactions(accountId: string, jwt: string): Promise<Record<string, unknown> | null> {
-    const state = await this.getEnableBankingState();
-    const sessionId = typeof state.latestSessionId === 'string' ? state.latestSessionId : null;
-    const candidates = this.buildEnableBankingTransactionCandidates(accountId, sessionId);
+    const url = this.buildEnableBankingTransactionCandidates(accountId)[0];
+    const response = await fetch(url, {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${jwt}`,
+        Accept: 'application/json',
+      },
+    });
 
-    let firstParsed: Record<string, unknown> | null = null;
+    const bodyText = await response.text();
+    const parsed = this.safeParseJson(bodyText);
 
-    for (const url of candidates) {
-      const response = await fetch(url, {
-        method: 'GET',
-        headers: {
-          Authorization: `Bearer ${jwt}`,
-          Accept: 'application/json',
-        },
-      });
-
-      if (!response.ok) {
-        continue;
-      }
-
-      const bodyText = await response.text();
-      const parsed = this.safeParseJson(bodyText);
-      if (!parsed) {
-        continue;
-      }
-
-      if (!firstParsed) {
-        firstParsed = parsed;
-      }
-
-      const entries = this.extractEnableBankingTransactionEntries(parsed);
-      if (entries.length > 0) {
-        return parsed;
-      }
+    if (response.status === 429) {
+      const detail = parsed && typeof parsed.message === 'string' ? parsed.message : 'Rate limit exceeded';
+      throw new Error(`Límite de accesos del banco alcanzado: ${detail}`);
     }
 
-    return firstParsed;
+    if (!response.ok) {
+      const detail = parsed ? JSON.stringify(parsed) : bodyText;
+      throw new Error(`Enable Banking transactions request failed (${response.status}): ${detail}`);
+    }
+
+    return parsed;
   }
 
-  private buildEnableBankingTransactionCandidates(accountId: string, _sessionId: string | null): string[] {
+  private buildEnableBankingTransactionCandidates(accountId: string): string[] {
     const today = new Date();
     const dateFrom = new Date(today);
     dateFrom.setFullYear(today.getFullYear() - 1);
@@ -511,10 +462,9 @@ export class FinanceService {
 
   private async probeEnableBankingTransactionEndpoints(
     accountId: string,
-    sessionId: string,
     jwt: string,
   ): Promise<Array<{ url: string; status: number; keys: string[]; entryCount: number; preview: string; sample: Record<string, unknown> | null }>> {
-    const candidates = this.buildEnableBankingTransactionCandidates(accountId, sessionId);
+    const candidates = this.buildEnableBankingTransactionCandidates(accountId);
     const results: Array<{ url: string; status: number; keys: string[]; entryCount: number; preview: string; sample: Record<string, unknown> | null }> = [];
 
     for (const url of candidates) {
@@ -592,7 +542,7 @@ export class FinanceService {
 
   private mapEnableBankingEntryToTransaction(
     entry: Record<string, unknown>,
-    context: { fallbackAccountId: string; sourceAccountId: string; sessionId: string },
+    context: { fallbackAccountId: string; sourceAccountId: string; bankKey: string },
   ): CreateTransactionDto | null {
     const amountInfo = (entry.transactionAmount as Record<string, unknown> | undefined)
       ?? (entry.transaction_amount as Record<string, unknown> | undefined)
@@ -648,8 +598,8 @@ export class FinanceService {
     ].find((value): value is string => typeof value === 'string' && value.length > 0);
 
     const externalId = externalIdCandidate
-      ? `${context.sessionId}:${context.sourceAccountId}:${externalIdCandidate}`
-      : `${context.sessionId}:${context.sourceAccountId}:${date}:${amount}:${type}`;
+      ? `${context.bankKey}:${context.sourceAccountId}:${externalIdCandidate}`
+      : `${context.bankKey}:${context.sourceAccountId}:${date}:${amount}:${type}`;
 
     return {
       accountId: context.fallbackAccountId,
@@ -775,15 +725,39 @@ export class FinanceService {
     };
   }
 
-  async getEnableBankingConnectUrl() {
+  async getEnableBankingConnections() {
+    const connections = await this.ensureEnableBankingConnections();
+    return connections.map((connection) => ({
+      bankKey: connection.bankKey,
+      bankName: connection.bankName,
+      status: connection.status,
+      connected: connection.status === 'connected',
+      sessionCreatedAt: connection.sessionCreatedAt ?? null,
+      lastSyncAt: connection.lastSyncAt ?? null,
+      lastSyncStatus: connection.lastSyncStatus ?? null,
+      lastSyncImported: connection.lastSyncImported ?? null,
+      lastSyncSkipped: connection.lastSyncSkipped ?? null,
+      lastSyncError: connection.lastSyncError ?? null,
+      accountCount: connection.accountCount ?? null,
+      lastExchangeError: connection.lastExchangeError ?? null,
+    }));
+  }
+
+  async getEnableBankingConnectUrl(bankKey: string) {
     const appId = process.env.ENABLE_BANKING_APP_ID;
     const redirectCandidates = this.getEnableBankingRedirectUrlCandidates();
     const privateKeyPem = this.getEnableBankingPrivateKeyPem();
     const country = process.env.ENABLE_BANKING_COUNTRY || 'ES';
-    const targetBank = (process.env.ENABLE_BANKING_TARGET_BANKS || 'Bankinter')
-      .split(',')
-      .map((item) => item.trim())
-      .filter(Boolean)[0] || 'Bankinter';
+
+    const connections = await this.ensureEnableBankingConnections();
+    const target = connections.find((connection) => connection.bankKey === bankKey);
+    if (!target) {
+      return {
+        configured: false,
+        error: `Unknown bank key: ${bankKey}`,
+        availableBanks: connections.map((connection) => connection.bankKey),
+      };
+    }
 
     if (!appId || redirectCandidates.length === 0 || !privateKeyPem) {
       return {
@@ -793,13 +767,17 @@ export class FinanceService {
     }
 
     const state = crypto.randomUUID();
-    await this.updateEnableBankingState({
+    await this.updateEnableBankingConnection(bankKey, {
+      status: 'pending',
       pendingState: state,
       pendingStateCreatedAt: new Date().toISOString(),
       lastExchangeError: null,
     });
 
     const jwt = this.createEnableBankingJwt(appId, privateKeyPem);
+    // Enable Banking rejects any name that doesn't exactly match its ASPSP directory
+    // (e.g. our "Unicaja" config vs. the directory's "Unicaja Banco"), so resolve it first.
+    const targetBank = await this.resolveAspspName(String(target.bankName), country, jwt);
     let resolvedAuthUrl: string | null = null;
     let selectedRedirectUrl: string | null = null;
     let lastStatus = 0;
@@ -826,6 +804,11 @@ export class FinanceService {
     }
 
     if (!resolvedAuthUrl || !selectedRedirectUrl) {
+      await this.updateEnableBankingConnection(bankKey, {
+        status: 'error',
+        lastExchangeError: `Enable Banking connect URL request failed (${lastStatus || 'unknown'})`,
+      });
+
       return {
         configured: false,
         error: `Enable Banking connect URL request failed (${lastStatus || 'unknown'})`,
@@ -833,7 +816,7 @@ export class FinanceService {
       };
     }
 
-    await this.updateEnableBankingState({ pendingRedirectUrl: selectedRedirectUrl });
+    await this.updateEnableBankingConnection(bankKey, { pendingRedirectUrl: selectedRedirectUrl });
 
     return {
       configured: true,
@@ -842,6 +825,7 @@ export class FinanceService {
       redirectUrl: selectedRedirectUrl,
       country,
       bank: targetBank,
+      bankKey,
     };
   }
 
@@ -852,90 +836,85 @@ export class FinanceService {
     errorDescription?: string;
   }) {
     const receivedAt = new Date().toISOString();
-    const existingState = await this.getEnableBankingState();
-    const stateMatches = Boolean(
-      input.state &&
-      typeof existingState.pendingState === 'string' &&
-      input.state === existingState.pendingState,
-    );
+
+    const connection = input.state ? await this.findConnectionByPendingState(input.state) : null;
+    if (!connection) {
+      return {
+        ok: false,
+        receivedAt,
+        bankKey: null,
+        bankName: null,
+        sessionConnected: false,
+        callbackError: input.error ?? 'No matching pending connection for this state',
+        callbackErrorDescription: input.errorDescription ?? null,
+        exchangeError: null,
+      };
+    }
+
+    const bankKey = String(connection.bankKey);
 
     let sessionId: string | null = null;
-    let exchangeResponse: Record<string, unknown> | string | null = null;
     let exchangeError: string | null = null;
 
     if (input.code) {
       try {
-        const exchanged = await this.exchangeEnableBankingCode(input.code, input.state);
+        const exchanged = await this.exchangeEnableBankingCode(bankKey, input.code, input.state);
         sessionId = exchanged.sessionId;
-        exchangeResponse = exchanged.raw;
       } catch (error) {
         exchangeError = error instanceof Error ? error.message : 'Unknown exchange error';
       }
+    } else if (input.error) {
+      exchangeError = input.errorDescription || input.error;
     }
 
     const patch: Record<string, unknown> = {
       pendingState: null,
       pendingStateCreatedAt: null,
       lastCallbackAt: receivedAt,
-      lastCallback: {
-        codePresent: Boolean(input.code),
-        state: input.state ?? null,
-        error: input.error ?? null,
-        errorDescription: input.errorDescription ?? null,
-      },
-      stateMatches,
       lastExchangeError: exchangeError,
-      lastExchangeResponse: exchangeResponse,
     };
 
     if (sessionId) {
-      patch.latestSessionId = sessionId;
-      patch.latestSessionAt = receivedAt;
+      patch.status = 'connected';
+      patch.sessionId = sessionId;
+      patch.sessionCreatedAt = receivedAt;
+    } else {
+      patch.status = 'error';
     }
 
-    const savedState = await this.updateEnableBankingState(patch);
+    const saved = await this.updateEnableBankingConnection(bankKey, patch);
 
     return {
-      ok: !input.error && !exchangeError,
+      ok: Boolean(sessionId) && !input.error,
       receivedAt,
-      stateMatches,
-      sessionId,
+      bankKey,
+      bankName: saved.bankName ?? null,
+      sessionConnected: Boolean(sessionId),
       callbackError: input.error ?? null,
       callbackErrorDescription: input.errorDescription ?? null,
       exchangeError,
-      next: '/api/enablebanking/session-status',
-      stored: {
-        latestSessionId: savedState.latestSessionId ?? null,
-        latestSessionAt: savedState.latestSessionAt ?? null,
-      },
     };
   }
 
-  async getEnableBankingSessionStatus() {
-    const state = await this.getEnableBankingState();
-    return {
-      latestSessionId: typeof state.latestSessionId === 'string' ? state.latestSessionId : null,
-      latestSessionAt: typeof state.latestSessionAt === 'string' ? state.latestSessionAt : null,
-      pendingStateCreatedAt:
-        typeof state.pendingStateCreatedAt === 'string' ? state.pendingStateCreatedAt : null,
-      hasPendingState: Boolean(state.pendingState),
-      stateMatches: state.stateMatches === true,
-      lastExchangeError:
-        typeof state.lastExchangeError === 'string' ? state.lastExchangeError : null,
-      lastCallbackAt: typeof state.lastCallbackAt === 'string' ? state.lastCallbackAt : null,
-      lastCallback: (state.lastCallback as Record<string, unknown> | undefined) ?? null,
-      lastSyncResult: (state.lastSyncResult as Record<string, unknown> | undefined) ?? null,
-    };
-  }
+  async debugEnableBankingPull(bankKey?: string) {
+    const connections = await this.ensureEnableBankingConnections();
+    const connection = bankKey
+      ? connections.find((item) => item.bankKey === bankKey)
+      : connections.find((item) => item.status === 'connected');
 
-  async debugEnableBankingPull() {
-    const state = await this.getEnableBankingState();
-    const sessionId = typeof state.latestSessionId === 'string' ? state.latestSessionId : null;
+    if (!connection) {
+      return {
+        ok: false,
+        error: bankKey ? `Unknown or unconfigured bank: ${bankKey}` : 'No connected bank found',
+        availableBanks: connections.map((item) => item.bankKey),
+      };
+    }
 
+    const sessionId = typeof connection.sessionId === 'string' ? connection.sessionId : null;
     if (!sessionId) {
       return {
         ok: false,
-        error: 'No active session id',
+        error: `Bank ${String(connection.bankKey)} is not connected yet`,
       };
     }
 
@@ -964,7 +943,7 @@ export class FinanceService {
     for (const accountId of accountIds) {
       // A single probe call doubles as the actual fetch (one candidate URL) so
       // debug-pull spends the same one access-per-account as a real sync.
-      const transactionProbes = await this.probeEnableBankingTransactionEndpoints(accountId, sessionId, jwt);
+      const transactionProbes = await this.probeEnableBankingTransactionEndpoints(accountId, jwt);
       const entryCount = transactionProbes.reduce((sum, probe) => sum + probe.entryCount, 0);
       const sample = transactionProbes.find((probe) => probe.sample)?.sample ?? null;
       totalTransactions += entryCount;
@@ -978,6 +957,7 @@ export class FinanceService {
 
     return {
       ok: true,
+      bankKey: connection.bankKey,
       sessionId,
       sessionAccess: sessionParsed?.access ?? null,
       sessionStatus: sessionParsed?.status ?? null,
@@ -1177,13 +1157,14 @@ export class FinanceService {
     return `${unsignedToken}.${this.b64url(signature)}`;
   }
 
-  private async exchangeEnableBankingCode(code: string, state?: string): Promise<{
+  private async exchangeEnableBankingCode(bankKey: string, code: string, state?: string): Promise<{
     sessionId: string | null;
     raw: Record<string, unknown> | string;
   }> {
     const appId = process.env.ENABLE_BANKING_APP_ID;
-    const existingState = await this.getEnableBankingState();
-    const stateRedirectUrl = existingState.pendingRedirectUrl;
+    const connections = await this.ensureEnableBankingConnections();
+    const connection = connections.find((item) => item.bankKey === bankKey);
+    const stateRedirectUrl = connection?.pendingRedirectUrl;
     const redirectUrl =
       typeof stateRedirectUrl === 'string' && stateRedirectUrl.length > 0
         ? stateRedirectUrl
@@ -1353,50 +1334,111 @@ export class FinanceService {
     };
   }
 
-  private async getEnableBankingState(): Promise<Record<string, unknown>> {
-    const settings = await this.getOrCreateSettings();
-    const integrationState = (settings.integrationState ?? {}) as Record<string, unknown>;
-    const enableBanking = integrationState.enableBanking;
+  private getTargetBankConfigs(): Array<{ bankKey: string; bankName: string }> {
+    const names = (process.env.ENABLE_BANKING_TARGET_BANKS || 'Bankinter,Unicaja,Caja Rural del Sur')
+      .split(',')
+      .map((item) => item.trim())
+      .filter(Boolean);
 
-    if (enableBanking && typeof enableBanking === 'object' && !Array.isArray(enableBanking)) {
-      return enableBanking as Record<string, unknown>;
-    }
-
-    return {};
+    return names.map((bankName) => ({ bankKey: this.normalizeBankName(bankName).replace(/ /g, '-'), bankName }));
   }
 
-  private async updateEnableBankingState(
-    patch: Record<string, unknown>,
-  ): Promise<Record<string, unknown>> {
+  private emptyEnableBankingConnection(
+    bankKey: string,
+    bankName: string,
+    overrides: Record<string, unknown> = {},
+  ): Record<string, unknown> {
+    return {
+      bankKey,
+      bankName,
+      status: 'not_connected',
+      sessionId: null,
+      sessionCreatedAt: null,
+      pendingState: null,
+      pendingStateCreatedAt: null,
+      pendingRedirectUrl: null,
+      lastCallbackAt: null,
+      lastExchangeError: null,
+      lastSyncAt: null,
+      lastSyncStatus: null,
+      lastSyncImported: null,
+      lastSyncSkipped: null,
+      lastSyncError: null,
+      accountCount: null,
+      ...overrides,
+    };
+  }
+
+  // Ensures every bank configured in ENABLE_BANKING_TARGET_BANKS has a connection
+  // slot, migrating the pre-multi-bank single-session state (which always connected
+  // the first configured bank) into that bank's slot the first time this runs.
+  private async ensureEnableBankingConnections(): Promise<Array<Record<string, unknown>>> {
     const settings = await this.getOrCreateSettings();
     const integrationState = (settings.integrationState ?? {}) as Record<string, unknown>;
-    const currentEnableBanking = integrationState.enableBanking;
-    const currentState =
-      currentEnableBanking &&
-      typeof currentEnableBanking === 'object' &&
-      !Array.isArray(currentEnableBanking)
-        ? (currentEnableBanking as Record<string, unknown>)
-        : {};
+    const existing = Array.isArray(integrationState.enableBankingConnections)
+      ? (integrationState.enableBankingConnections as Array<Record<string, unknown>>)
+      : [];
 
-    const nextEnableBankingState = {
-      ...currentState,
-      ...patch,
-    };
+    const targets = this.getTargetBankConfigs();
+    const legacy = (integrationState.enableBanking ?? {}) as Record<string, unknown>;
+    const legacySessionId = typeof legacy.latestSessionId === 'string' ? legacy.latestSessionId : null;
+
+    const byKey = new Map(existing.map((connection) => [String(connection.bankKey), connection]));
+    let changed = existing.length !== targets.length;
+
+    const next = targets.map((target, index) => {
+      const found = byKey.get(target.bankKey);
+      if (found) {
+        return found;
+      }
+
+      changed = true;
+      if (index === 0 && legacySessionId) {
+        return this.emptyEnableBankingConnection(target.bankKey, target.bankName, {
+          status: 'connected',
+          sessionId: legacySessionId,
+          sessionCreatedAt: typeof legacy.latestSessionAt === 'string' ? legacy.latestSessionAt : new Date().toISOString(),
+        });
+      }
+
+      return this.emptyEnableBankingConnection(target.bankKey, target.bankName);
+    });
+
+    if (changed) {
+      await this.settingsModel.updateOne(
+        { key: 'global' },
+        { $set: { 'integrationState.enableBankingConnections': next } },
+        { upsert: true },
+      );
+    }
+
+    return next;
+  }
+
+  private async updateEnableBankingConnection(
+    bankKey: string,
+    patch: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> {
+    const connections = await this.ensureEnableBankingConnections();
+    const index = connections.findIndex((connection) => connection.bankKey === bankKey);
+    if (index === -1) {
+      throw new NotFoundException(`Unknown bank: ${bankKey}`);
+    }
+
+    connections[index] = { ...connections[index], ...patch };
 
     await this.settingsModel.updateOne(
       { key: 'global' },
-      {
-        $set: {
-          integrationState: {
-            ...integrationState,
-            enableBanking: nextEnableBankingState,
-          },
-        },
-      },
+      { $set: { 'integrationState.enableBankingConnections': connections } },
       { upsert: true },
     );
 
-    return nextEnableBankingState;
+    return connections[index];
+  }
+
+  private async findConnectionByPendingState(state: string): Promise<Record<string, unknown> | null> {
+    const connections = await this.ensureEnableBankingConnections();
+    return connections.find((connection) => connection.pendingState === state) ?? null;
   }
 
   private b64url(input: string | Buffer): string {
@@ -1422,6 +1464,28 @@ export class FinanceService {
       const normalizedCandidate = this.normalizeBankName(candidate);
       return tokens.every((token) => normalizedCandidate.includes(token));
     };
+  }
+
+  // Enable Banking's /auth endpoint requires the exact ASPSP directory name
+  // (e.g. "Unicaja Banco", not our shorter "Unicaja" config value).
+  private async resolveAspspName(configuredName: string, country: string, jwt: string): Promise<string> {
+    try {
+      const response = await fetch(`https://api.enablebanking.com/aspsps?country=${country}`, {
+        method: 'GET',
+        headers: { Authorization: `Bearer ${jwt}`, Accept: 'application/json' },
+      });
+
+      if (!response.ok) {
+        return configuredName;
+      }
+
+      const data = (await response.json()) as { aspsps?: Array<{ name?: string }> };
+      const names = (data.aspsps ?? []).map((item) => item?.name).filter((name): name is string => Boolean(name));
+      const matcher = this.buildTargetMatcher(configuredName);
+      return names.find(matcher) ?? configuredName;
+    } catch {
+      return configuredName;
+    }
   }
 
   private async ensureSeedData() {

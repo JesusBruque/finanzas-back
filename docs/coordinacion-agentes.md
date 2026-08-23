@@ -64,6 +64,13 @@ Se trabaja por contrato, no por improvisación:
 - sincronización de contexto entre repos
 - alineación de reglas para futuros agentes
 
+### Bloque 8
+
+- conexión independiente por banco (Bankinter, Unicaja, Caja Rural del Sur)
+- cuentas reales creadas automáticamente por banco al sincronizar
+- sincronización diaria disparada por n8n (Schedule Trigger) contra `/api/bank-sync/scheduled`
+- redirect al frontend tras conectar un banco (`FRONTEND_APP_URL`)
+
 ## Reglas obligatorias del proyecto
 
 - La documentación no es opcional; es parte del producto.

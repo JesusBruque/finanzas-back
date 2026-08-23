@@ -1,7 +1,7 @@
-import { Body, Controller, Delete, Get, Headers, Param, Post, Put, Query } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Headers, Param, Post, Put, Query, Res } from '@nestjs/common';
+import type { Response } from 'express';
 import { FinanceService } from './finance.service';
 import {
-  BankSyncDto,
   CreateAccountDto,
   CreateExpenseDto,
   CreateTransactionDto,
@@ -90,8 +90,13 @@ export class Block1Controller {
   }
 
   @Post('bank-sync')
-  triggerBankSync(@Body() dto: BankSyncDto) {
-    return this.financeService.triggerBankSync(dto);
+  triggerBankSync() {
+    return this.financeService.triggerBankSync();
+  }
+
+  @Post('bank-sync/scheduled')
+  triggerScheduledBankSync(@Headers('x-api-key') apiKey?: string) {
+    return this.financeService.triggerScheduledBankSync(apiKey);
   }
 
   @Get('sync-history')
@@ -104,48 +109,62 @@ export class Block1Controller {
     return this.financeService.getEnableBankingTargetBanks();
   }
 
+  @Get('enablebanking/connections')
+  getEnableBankingConnections() {
+    return this.financeService.getEnableBankingConnections();
+  }
+
   @Get('enablebanking/connect-url')
-  getEnableBankingConnectUrl() {
-    return this.financeService.getEnableBankingConnectUrl();
+  getEnableBankingConnectUrl(@Query('bank') bank?: string) {
+    if (!bank) {
+      return { configured: false, error: 'Missing required "bank" query parameter' };
+    }
+
+    return this.financeService.getEnableBankingConnectUrl(bank);
   }
 
   @Get('enablebanking/callback')
-  handleEnableBankingCallback(
-    @Query('code') code?: string,
-    @Query('state') state?: string,
-    @Query('error') error?: string,
-    @Query('error_description') errorDescription?: string,
+  async handleEnableBankingCallback(
+    @Query('code') code: string | undefined,
+    @Query('state') state: string | undefined,
+    @Query('error') error: string | undefined,
+    @Query('error_description') errorDescription: string | undefined,
+    @Res() res: Response,
   ) {
-    return this.financeService.handleEnableBankingCallback({
+    const result = await this.financeService.handleEnableBankingCallback({
       code,
       state,
       error,
       errorDescription,
     });
+
+    const frontendUrl = process.env.FRONTEND_APP_URL?.trim();
+    if (frontendUrl) {
+      const redirectUrl = new URL(frontendUrl);
+      redirectUrl.searchParams.set('bank_connected', result.ok ? 'success' : 'error');
+      if (result.bankKey) {
+        redirectUrl.searchParams.set('bank', result.bankKey);
+      }
+      res.redirect(302, redirectUrl.toString());
+      return;
+    }
+
+    res.status(200).json(result);
   }
 
   @Get('enable-banking/callback')
   handleEnableBankingCallbackAlias(
-    @Query('code') code?: string,
-    @Query('state') state?: string,
-    @Query('error') error?: string,
-    @Query('error_description') errorDescription?: string,
+    @Query('code') code: string | undefined,
+    @Query('state') state: string | undefined,
+    @Query('error') error: string | undefined,
+    @Query('error_description') errorDescription: string | undefined,
+    @Res() res: Response,
   ) {
-    return this.financeService.handleEnableBankingCallback({
-      code,
-      state,
-      error,
-      errorDescription,
-    });
-  }
-
-  @Get('enablebanking/session-status')
-  getEnableBankingSessionStatus() {
-    return this.financeService.getEnableBankingSessionStatus();
+    return this.handleEnableBankingCallback(code, state, error, errorDescription, res);
   }
 
   @Get('enablebanking/debug-pull')
-  debugEnableBankingPull() {
-    return this.financeService.debugEnableBankingPull();
+  debugEnableBankingPull(@Query('bank') bank?: string) {
+    return this.financeService.debugEnableBankingPull(bank);
   }
 }

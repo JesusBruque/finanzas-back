@@ -22,6 +22,15 @@ export class Account {
 
   @Prop({ required: true, default: () => new Date().toISOString() })
   createdAt: string;
+
+  @Prop()
+  bankKey?: string;
+
+  @Prop()
+  bankName?: string;
+
+  @Prop()
+  externalAccountId?: string;
 }
 
 export const AccountSchema = SchemaFactory.createForClass(Account);

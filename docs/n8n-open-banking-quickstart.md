@@ -1,5 +1,18 @@
 # n8n + Open Banking Quickstart (primer uso)
 
+## Flujo actual (multi-banco, recomendado)
+
+Desde el bloque 8 del contrato de API, la app soporta conectar varios bancos (Bankinter, Unicaja, Caja Rural del Sur, configurables vía `ENABLE_BANKING_TARGET_BANKS`) de forma independiente. El backend hace **todo** el trabajo con Enable Banking (JWT, sesiones, mapeo de movimientos); n8n solo actúa como reloj despertador diario.
+
+1. Desde la app, pulsa "Conectar" en cada tarjeta de banco (una vez por banco). Enable Banking te redirige a autorizar y vuelve a la app.
+2. Importa `docs/n8n-workflow-finanzas-daily-sync.json` en n8n: un Schedule Trigger (07:00 por defecto) que llama a `POST /api/bank-sync/scheduled` con cabecera `x-api-key: BANK_INGEST_API_KEY`.
+3. Activa el workflow. Cada día, n8n dispara el sync; el backend sincroniza todos los bancos conectados y actualiza `sync-history` y `enablebanking/connections`.
+4. Puedes forzar un sync manual en cualquier momento con el botón "Sincronizar ahora" en la app (llama a `POST /api/bank-sync`, sin cabecera).
+
+Ver `docs/api-contract.md` (Bloque 8) para el detalle de payloads. El resto de este documento describe el flujo original de un solo banco/demo, útil como referencia histórica.
+
+---
+
 Este documento te deja un camino simple para lograr comunicacion real entre tu backend y n8n aunque no hayas usado n8n antes.
 
 ## Objetivo de hoy

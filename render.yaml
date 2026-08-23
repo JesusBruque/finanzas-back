@@ -24,3 +24,5 @@ services:
         value: Banco de Sabadell,BBVA
       - key: ENABLE_BANKING_REDIRECT_URL
         sync: false
+      - key: FRONTEND_APP_URL
+        sync: false

@@ -65,12 +65,6 @@ export class CreateTransactionDto {
   source?: 'manual' | 'bank' | 'n8n';
 }
 
-export class BankSyncDto {
-  @IsOptional()
-  @IsString()
-  provider?: string;
-}
-
 export class ImportTransactionsDto {
   @IsOptional()
   @IsArray()
