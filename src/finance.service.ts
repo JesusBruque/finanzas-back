@@ -466,16 +466,27 @@ export class FinanceService {
     const candidates = [
       `https://api.enablebanking.com/accounts/${accountId}/transactions`,
       `https://api.enablebanking.com/accounts/${accountId}/transactions?booking_status=booked`,
+      `https://api.enablebanking.com/accounts/${accountId}/transactions?booking_status=BOOK`,
+      `https://api.enablebanking.com/accounts/${accountId}/transactions?booking_status=both`,
       `https://api.enablebanking.com/accounts/${accountId}/transactions?date_from=${dateFromIso}&date_to=${dateToIso}`,
       `https://api.enablebanking.com/accounts/${accountId}/transactions?booking_status=booked&date_from=${dateFromIso}&date_to=${dateToIso}`,
+      `https://api.enablebanking.com/accounts/${accountId}/transactions?booking_status=BOOK&date_from=${dateFromIso}&date_to=${dateToIso}`,
+      `https://api.enablebanking.com/accounts/${accountId}/transactions?booking_status=both&date_from=${dateFromIso}&date_to=${dateToIso}`,
       ...(sessionId
         ? [
             `https://api.enablebanking.com/sessions/${sessionId}/accounts/${accountId}/transactions`,
             `https://api.enablebanking.com/sessions/${sessionId}/accounts/${accountId}/transactions?booking_status=booked`,
+            `https://api.enablebanking.com/sessions/${sessionId}/accounts/${accountId}/transactions?booking_status=BOOK`,
+            `https://api.enablebanking.com/sessions/${sessionId}/accounts/${accountId}/transactions?booking_status=both`,
             `https://api.enablebanking.com/sessions/${sessionId}/accounts/${accountId}/transactions?date_from=${dateFromIso}&date_to=${dateToIso}`,
+            `https://api.enablebanking.com/sessions/${sessionId}/accounts/${accountId}/transactions?booking_status=booked&date_from=${dateFromIso}&date_to=${dateToIso}`,
+            `https://api.enablebanking.com/sessions/${sessionId}/accounts/${accountId}/transactions?booking_status=BOOK&date_from=${dateFromIso}&date_to=${dateToIso}`,
+            `https://api.enablebanking.com/sessions/${sessionId}/accounts/${accountId}/transactions?booking_status=both&date_from=${dateFromIso}&date_to=${dateToIso}`,
           ]
         : []),
     ];
+
+    let firstParsed: Record<string, unknown> | null = null;
 
     for (const url of candidates) {
       const response = await fetch(url, {
@@ -492,12 +503,21 @@ export class FinanceService {
 
       const bodyText = await response.text();
       const parsed = this.safeParseJson(bodyText);
-      if (parsed) {
+      if (!parsed) {
+        continue;
+      }
+
+      if (!firstParsed) {
+        firstParsed = parsed;
+      }
+
+      const entries = this.extractEnableBankingTransactionEntries(parsed);
+      if (entries.length > 0) {
         return parsed;
       }
     }
 
-    return null;
+    return firstParsed;
   }
 
   private extractEnableBankingTransactionEntries(payload: Record<string, unknown> | null): Record<string, unknown>[] {
