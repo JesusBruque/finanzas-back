@@ -39,7 +39,7 @@ export class FinanceService {
   ) {}
 
   async getBootstrap() {
-    await this.ensureSeedData();
+    await this.ensureSettingsInitialized();
 
     const settings = await this.getOrCreateSettings();
     const expenses = await this.expenseModel.find().sort({ createdAt: -1 }).lean();
@@ -91,7 +91,7 @@ export class FinanceService {
   }
 
   async getAccounts() {
-    await this.ensureSeedData();
+    await this.ensureSettingsInitialized();
     const accounts = await this.accountModel.find().sort({ createdAt: -1 }).lean();
     return accounts.map(({ _id, ...account }) => ({
       ...account,
@@ -119,7 +119,7 @@ export class FinanceService {
   }
 
   async getTransactions() {
-    await this.ensureSeedData();
+    await this.ensureSettingsInitialized();
     const transactions = await this.transactionModel.find().sort({ date: -1, createdAt: -1 }).lean();
     return transactions.map(({ _id, ...transaction }) => ({
       ...transaction,
@@ -128,7 +128,7 @@ export class FinanceService {
   }
 
   async createTransaction(dto: CreateTransactionDto) {
-    await this.ensureSeedData();
+    await this.ensureSettingsInitialized();
 
     const account = await this.accountModel.findOne({ id: dto.accountId }).lean();
     if (!account) {
@@ -266,23 +266,27 @@ export class FinanceService {
 
     const bankName = String(connection.bankName);
     const jwt = this.createEnableBankingJwt(appId, privateKeyPem);
-    const accountUids = await this.fetchEnableBankingAccountIds(sessionId, jwt);
-    if (accountUids.length === 0) {
+    const accountIdentities = await this.fetchEnableBankingAccountIdentities(sessionId, jwt);
+    if (accountIdentities.length === 0) {
       throw new Error('No se encontraron cuentas para la sesión autorizada');
     }
 
     const transactions: CreateTransactionDto[] = [];
 
-    for (let index = 0; index < accountUids.length; index += 1) {
-      const accountUid = accountUids[index];
-      const localAccount = await this.getOrCreateBankAccount(bankKey, bankName, accountUid, index);
-      const payload = await this.fetchEnableBankingAccountTransactions(accountUid, jwt);
+    for (let index = 0; index < accountIdentities.length; index += 1) {
+      const identity = accountIdentities[index];
+      // stableKey survives session renewal (Enable Banking rotates the per-session
+      // uid on every reconnect but identification_hash stays the same for the
+      // same real account), so it's used for account matching and dedup — the
+      // live API call still needs the session-scoped uid.
+      const localAccount = await this.getOrCreateBankAccount(bankKey, bankName, identity.stableKey, index);
+      const payload = await this.fetchEnableBankingAccountTransactions(identity.uid, jwt);
       const rawEntries = this.extractEnableBankingTransactionEntries(payload);
 
       for (const rawEntry of rawEntries) {
         const mapped = this.mapEnableBankingEntryToTransaction(rawEntry, {
           fallbackAccountId: localAccount.id,
-          sourceAccountId: accountUid,
+          sourceAccountId: identity.stableKey,
           bankKey,
         });
 
@@ -294,7 +298,7 @@ export class FinanceService {
 
     if (transactions.length === 0) {
       // No new movements is a normal, successful outcome — not every sync finds fresh transactions.
-      return { imported: 0, skipped: 0, accountCount: accountUids.length, fetchedCount: 0 };
+      return { imported: 0, skipped: 0, accountCount: accountIdentities.length, fetchedCount: 0 };
     }
 
     const imported = await this.importTransactionsUnchecked({
@@ -305,7 +309,7 @@ export class FinanceService {
     return {
       imported: imported.imported,
       skipped: imported.skipped ?? 0,
-      accountCount: accountUids.length,
+      accountCount: accountIdentities.length,
       fetchedCount: transactions.length,
     };
   }
@@ -339,11 +343,22 @@ export class FinanceService {
   }
 
   private async fetchEnableBankingAccountIds(sessionId: string, jwt: string): Promise<string[]> {
+    const identities = await this.fetchEnableBankingAccountIdentities(sessionId, jwt);
+    return identities.map((identity) => identity.uid);
+  }
+
+  private async fetchEnableBankingAccountIdentities(
+    sessionId: string,
+    jwt: string,
+  ): Promise<Array<{ uid: string; stableKey: string }>> {
+    // /sessions/{id} is tried first: every other candidate has consistently 404'd
+    // in practice, and this is the one response that also carries accounts_data
+    // (needed to resolve the session-independent identification_hash below).
     const candidates = [
+      `https://api.enablebanking.com/sessions/${sessionId}`,
       `https://api.enablebanking.com/sessions/${sessionId}/accounts`,
       `https://api.enablebanking.com/accounts?session_id=${encodeURIComponent(sessionId)}`,
       `https://api.enablebanking.com/accounts?session=${encodeURIComponent(sessionId)}`,
-      `https://api.enablebanking.com/sessions/${sessionId}`,
     ];
 
     for (const url of candidates) {
@@ -361,13 +376,45 @@ export class FinanceService {
 
       const bodyText = await response.text();
       const parsed = this.safeParseJson(bodyText);
-      const accountIds = this.extractEnableBankingAccountIds(parsed);
-      if (accountIds.length > 0) {
-        return accountIds;
+      const identities = this.extractEnableBankingAccountIdentities(parsed);
+      if (identities.length > 0) {
+        return identities;
       }
     }
 
     return [];
+  }
+
+  private extractEnableBankingAccountIdentities(
+    payload: Record<string, unknown> | null,
+  ): Array<{ uid: string; stableKey: string }> {
+    const uids = this.extractEnableBankingAccountIds(payload);
+    if (uids.length === 0) {
+      return [];
+    }
+
+    // Enable Banking rotates each account's uid on every new session/consent, but
+    // identification_hash (also privacy-preserving, no raw IBAN/name) stays the
+    // same for the same real account across reconnects — confirmed by comparing
+    // Bankinter's identification_hash values across two separate sessions.
+    const hashByUid = new Map<string, string>();
+    const accountsData = payload?.accounts_data;
+    if (Array.isArray(accountsData)) {
+      for (const entry of accountsData) {
+        if (!entry || typeof entry !== 'object') {
+          continue;
+        }
+
+        const record = entry as Record<string, unknown>;
+        const uid = typeof record.uid === 'string' ? record.uid : null;
+        const hash = typeof record.identification_hash === 'string' ? record.identification_hash : null;
+        if (uid && hash) {
+          hashByUid.set(uid, hash);
+        }
+      }
+    }
+
+    return uids.map((uid) => ({ uid, stableKey: hashByUid.get(uid) ?? uid }));
   }
 
   private extractEnableBankingAccountIds(payload: Record<string, unknown> | null): string[] {
@@ -1061,7 +1108,7 @@ export class FinanceService {
   }
 
   async getBudgetPlan() {
-    await this.ensureSeedData();
+    await this.ensureSettingsInitialized();
     const settings = await this.getOrCreateSettings();
     const currentMonth = new Date().toISOString().slice(0, 7);
     const transactions = await this.transactionModel.find({ date: { $regex: `^${currentMonth}` } }).lean();
@@ -1498,79 +1545,7 @@ export class FinanceService {
     }
   }
 
-  private async ensureSeedData() {
-    const accountCount = await this.accountModel.countDocuments();
-    if (accountCount === 0) {
-      await this.accountModel.create({
-        id: 'acc_001',
-        name: 'Cuenta principal',
-        type: 'checking',
-        balance: 2450.75,
-        currency: 'EUR',
-        createdAt: '2026-08-22T10:00:00.000Z',
-      });
-    }
-
-    const transactionCount = await this.transactionModel.countDocuments();
-    if (transactionCount === 0) {
-      await this.transactionModel.insertMany([
-        {
-          id: 'txn_001',
-          accountId: 'acc_001',
-          categoryId: 'cat_001',
-          date: '2026-08-20',
-          amount: 84.5,
-          description: 'Compra supermercado',
-          type: 'expense',
-          source: 'manual',
-          createdAt: '2026-08-22T08:14:00.000Z',
-        },
-        {
-          id: 'txn_002',
-          accountId: 'acc_001',
-          categoryId: 'cat_002',
-          date: '2026-08-01',
-          amount: 2200,
-          description: 'Nomina',
-          type: 'income',
-          source: 'manual',
-          createdAt: '2026-08-02T09:00:00.000Z',
-        },
-        {
-          id: 'txn_003',
-          accountId: 'acc_001',
-          categoryId: 'cat_003',
-          date: '2026-08-12',
-          amount: 50,
-          description: 'Internet',
-          type: 'expense',
-          source: 'manual',
-          createdAt: '2026-08-12T10:00:00.000Z',
-        },
-        {
-          id: 'txn_004',
-          accountId: 'acc_001',
-          categoryId: 'cat_004',
-          date: '2026-08-15',
-          amount: 50,
-          description: 'Luz',
-          type: 'expense',
-          source: 'manual',
-          createdAt: '2026-08-15T12:00:00.000Z',
-        },
-      ]);
-    }
-
-    const syncHistoryCount = await this.syncHistoryModel.countDocuments();
-    if (syncHistoryCount === 0) {
-      await this.syncHistoryModel.create({
-        id: 'sync_001',
-        provider: 'open-banking',
-        status: 'success',
-        syncAt: '2026-08-22T10:00:00.000Z',
-      });
-    }
-
+  private async ensureSettingsInitialized() {
     await this.getOrCreateSettings();
   }
 
