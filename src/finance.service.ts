@@ -553,8 +553,11 @@ export class FinanceService {
       return null;
     }
 
+    // Enable Banking always reports the amount unsigned (e.g. "1.23", never "-1.23");
+    // direction comes exclusively from credit_debit_indicator (CRDT/DBIT). Treating a
+    // positive-but-unsigned amount as "income" by default misclassified every expense.
     const indicator = String(entry.creditDebitIndicator ?? entry.credit_debit_indicator ?? '').toUpperCase();
-    const isIncome = indicator === 'CRDT' || numericAmount > 0;
+    const isIncome = indicator === 'CRDT';
     const type: 'income' | 'expense' = isIncome ? 'income' : 'expense';
     const amount = Math.abs(numericAmount);
 
