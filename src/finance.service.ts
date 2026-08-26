@@ -297,7 +297,7 @@ export class FinanceService {
       return { imported: 0, skipped: 0, accountCount: accountUids.length, fetchedCount: 0 };
     }
 
-    const imported = await this.importTransactions({
+    const imported = await this.importTransactionsUnchecked({
       source: 'bank',
       transactions,
     });
@@ -619,6 +619,13 @@ export class FinanceService {
       throw new UnauthorizedException('Invalid import API key');
     }
 
+    return this.importTransactionsUnchecked(dto);
+  }
+
+  // Used by the public /api/transactions/import HTTP endpoint (guarded above by
+  // BANK_INGEST_API_KEY) and directly by the internal Enable Banking sync path,
+  // which is already trusted server-side code and isn't an external HTTP caller.
+  private async importTransactionsUnchecked(dto?: ImportTransactionsDto) {
     const source = dto?.source ?? 'n8n';
     const items = dto?.transactions ?? [];
     let imported = 0;
